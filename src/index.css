@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  color: #f6efe6;
+  background: #120c0a;
+}
+
+button, input, select {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(232, 160, 106, 0.35);
+}
