@@ -4,7 +4,7 @@ import json
 import os
 import sys
 
-sys.path[:0] = ["/tmp", "/tmp/kamikoi-sim"]
+sys.path[:0] = ["/Users/antho/Desktop/kamikoi-sim"]
 import sim10
 import teamfight
 
@@ -22,6 +22,11 @@ def conv(value):
 
 
 units = {}
+if not teamfight.ascend_blobs():
+    raise SystemExit(
+        "refusing to write the catalog: the star-upgrade table loaded 0 rows, "
+        "so a rebuild would drop those effects"
+    )
 for role_id in teamfight.ROLES:
     units[role_id] = {str(stars): conv(teamfight.unit_for(role_id, stars)) for stars in range(1, 6)}
 
@@ -53,7 +58,7 @@ for fid, row in sim10.status_rows.items():
         "shown": teamfight._shown_buff(fid),
     }
 
-with open("/tmp/kamikoi-sim/leaders.json", encoding="utf-8") as handle:
+with open("/Users/antho/Desktop/kamikoi-sim/leaders.json", encoding="utf-8") as handle:
     leaders = json.load(handle)
 
 catalog = {
