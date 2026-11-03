@@ -542,7 +542,7 @@ export default function App() {
   const [ranked, setRanked] = useState<{ ids: string[]; n: number; stars: number; element: string } | null>(null);
   const [unitId, setUnitId] = useState(units.find((unit) => unit.portrait)?.id || units[0]?.id || "");
   const [showCharacter, setShowCharacter] = useState(false);
-  const [unitOrigin, setUnitOrigin] = useState<"leaders" | "list">("list");
+  const [fromLeaders, setFromLeaders] = useState(false);
   const [search, setSearch] = useState("");
   const characterRef = useRef<HTMLDivElement>(null);
 
@@ -599,21 +599,23 @@ export default function App() {
 
   function openUnit(id: string) {
     const unit = byId.get(id);
-    if (unit && !unit.portrait && !UNIT_ICONS.has(unit.id)) setPool("all");
+    if (leaderRelease === "all" || (unit && !unit.portrait && !UNIT_ICONS.has(unit.id))) setPool("all");
     setUnitId(id);
     setSearch("");
     setShowCharacter(true);
-    setUnitOrigin("leaders");
+    setFromLeaders(true);
     setView("units");
     window.setTimeout(() => characterRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
   }
 
   function leaveUnit() {
-    if (unitOrigin === "leaders") {
-      setView("leaders");
-      return;
-    }
     setShowCharacter(false);
+  }
+
+  function backToLeaders() {
+    setShowCharacter(false);
+    setFromLeaders(false);
+    setView("leaders");
   }
 
   function loadTeam(row: any) {
@@ -664,7 +666,7 @@ export default function App() {
               const next = id as "build" | "leaders" | "units" | "mechanics";
               if (next !== "units") {
                 setShowCharacter(false);
-                setUnitOrigin("list");
+                setFromLeaders(false);
               }
               setView(next);
             }}
@@ -1081,7 +1083,6 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setUnitId(unit.id);
-                      setUnitOrigin("list");
                       setShowCharacter(true);
                       window.setTimeout(() => characterRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
                     }}
@@ -1105,13 +1106,24 @@ export default function App() {
             </div>
             {selectedUnit && (
               <div ref={characterRef} className={showCharacter ? "scroll-mt-4 block" : "hidden md:block"}>
-                <button
-                  type="button"
-                  onClick={leaveUnit}
-                  className={`mb-3 rounded-full bg-white/10 px-3 py-1.5 text-sm ring-1 ring-white/15 ${unitOrigin === "leaders" ? "" : "md:hidden"}`}
-                >
-                  {unitOrigin === "leaders" ? "Back to top teams" : "Back to the list"}
-                </button>
+                <div className="mb-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={leaveUnit}
+                    className={`rounded-full bg-white/10 px-3 py-1.5 text-sm ring-1 ring-white/15 ${fromLeaders ? "" : "md:hidden"}`}
+                  >
+                    Back to the list
+                  </button>
+                  {fromLeaders && (
+                  <button
+                    type="button"
+                    onClick={backToLeaders}
+                    className="rounded-full bg-white/10 px-3 py-1.5 text-sm ring-1 ring-white/15"
+                  >
+                    Back to top teams
+                  </button>
+                  )}
+                </div>
                 <div className="flex flex-col gap-4 sm:flex-row">
                   {(UNIT_ART.has(selectedUnit.id) || UNIT_ICONS.has(selectedUnit.id)) && (
                   <img
