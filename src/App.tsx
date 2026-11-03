@@ -252,7 +252,7 @@ function TurnChart({ units }: { units: { id: string; name: string; turns: number
   return (
     <div className="mt-5">
       <h3 className="font-display text-xl">Each turn</h3>
-      <p className="mt-1 text-sm text-white/60">Solid line is damage, dashed is healing, dotted is shield. Hover a turn to see the breakdown. Click a name to hide that unit.</p>
+      <p className="mt-1 text-sm text-white/60">The solid line is damage, the dashed line is healing, and the dotted line is shield. Hover over a turn to see the breakdown. Click a name to hide that unit.</p>
       <div className="mt-3 flex flex-wrap gap-2">
         {units.map((unit, index) => (
           <button
@@ -344,7 +344,7 @@ function TurnChart({ units }: { units: { id: string; name: string; turns: number
             {fmt(units[focus].shield_turns.reduce((sum, value) => sum + value, 0))} shield
           </p>
         ) : (
-          <p>Hover a turn.</p>
+          <p>Hover over a turn.</p>
         )}
       </div>
     </div>
@@ -631,8 +631,8 @@ export default function App() {
             <h1 className="font-display text-2xl font-medium text-ember sm:text-3xl">Godly Love: On Air</h1>
             {page === "build" && (
               <p className="mt-1 max-w-xl text-sm text-white/60">
-                Level 80 units. Damage here is the total across 30 of the boss's turns, and the boss returns at full HP after each defeat. SSR top teams use that same fight, and leave a team off the list if anyone dies. SR & R top teams end the fight when the boss dies, and keep a team when someone is still standing. The {elementName(leaderElement)} boss is {bossKit.name}: {fmt(bossKit.hp)} HP, {fmt(bossKit.atk)} attack, {fmt(bossKit.defn)} defense, {fmt(bossKit.spd)} speed, with that unit's basic, ultimate, and passive.
-                {visible.some((unit) => unit.rarity === "SR" || unit.rarity === "R") ? " SR starts from 9,000 HP, 1,350 attack, and 1,125 defense. R starts from 8,000, 1,200, and 1,000. Each unit still multiplies that by its own coefficients." : ""}
+                Level 80 units. The damage shown is the total across 30 of the boss's turns, and the boss returns to full HP after each defeat. An SSR team is left off the list if anyone dies. An SR or R team stays on the list only if someone is still standing when the boss dies. The {elementName(leaderElement)} boss is {bossKit.name}: {fmt(bossKit.hp)} HP, {fmt(bossKit.atk)} attack, {fmt(bossKit.defn)} defense, {fmt(bossKit.spd)} speed, using that unit's basic, ultimate, and passive.
+                {visible.some((unit) => unit.rarity === "SR" || unit.rarity === "R") ? " SR units start at 9,000 HP, 1,350 attack, and 1,125 defense. R units start at 8,000 HP, 1,200 attack, and 1,000 defense. Each unit then applies its own stat rates." : ""}
               </p>
             )}
             {page === "mechanics" && (
@@ -712,7 +712,7 @@ export default function App() {
                 {leaderRarity === "ssr" ? (
                   <>
                     <p className="text-xs uppercase tracking-[0.16em] text-ember">This list · SSR</p>
-                    <p className="mt-1 text-sm text-white/80">The fight ends when the boss dies. The team has to clear twice in a row, with someone still standing each time. The slower clear sets the order: boss turns, then ally actions, then damage taken. If nobody does that within 15 boss turns, the list is the teams that dealt the most damage instead.</p>
+                    <p className="mt-1 text-sm text-white/80">The fight ends when the boss dies. A team has to clear three times in a row, with someone still standing each time. The slower clear decides the order: boss turns, then ally actions, then damage taken. If no team clears three times within 15 boss turns, the list shows the teams that dealt the most damage.</p>
                   </>
                 ) : (
                   <>
@@ -724,7 +724,7 @@ export default function App() {
               {tally.length > 0 && (
               <>
               <h3 className="mt-5 font-display text-xl">Core units</h3>
-              <p className="mt-1 text-sm text-white/65">The units who show up most, up to 10. A unit needs at least 3 of these teams.</p>
+              <p className="mt-1 text-sm text-white/65">The units that appear most often, up to 10. A unit has to be on at least 3 of these teams.</p>
               <div className="mt-3 flex flex-wrap gap-2">
                 {tally.map((unit) => (
                   <button
@@ -802,7 +802,8 @@ export default function App() {
               <h2 className="font-display text-2xl">Enemy targeting</h2>
               <div className="mt-3 space-y-3 text-sm text-white/80">
                 <p>An enemy with <Tip name="Taunt" /> attacks the ally who applied it.</p>
-                <p>Otherwise the enemy attacks the ally with the lowest current HP. Element changes that comparison. An ally the enemy's element beats counts as <Num>80,000</Num> HP lower, so they are more likely to be chosen. An ally whose element beats the enemy counts as <Num>90,000</Num> HP higher, so they are less likely to be chosen. If those totals match, the ally in the earlier team slot is attacked.</p>
+                <p>Slot 1 is the front position. Slot 4 is the back position.</p>
+                <p>On <Num>60%</Num> of single-target attacks, a monster looks only at slot 1. On the other <Num>40%</Num>, it looks at the whole team. If any ally in that group has an element the monster beats, the monster chooses only from those allies. If more than one ally is left, it attacks the one with the lowest percent of health remaining.</p>
                 <p><Tip name="Stealth" /> and <Tip name="Invincible" /> are skipped while another ally can still be hit.</p>
               </div>
             </div>
@@ -820,7 +821,7 @@ export default function App() {
               <div className="mt-3 space-y-3 text-sm text-white/80">
                 <p>Bosses are immune to Silence, <Tip name="Stun" />, <Tip name="Taunt" />, <Tip name="Provoke" />, <Tip name="Slumber" />, and <Tip name="Poison" />. <Tip name="Bleed" />, <Tip name="Burn" />, and debuffs such as ATK Down, DEF Down, and SPD Down can still land.</p>
                 <p>Elite enemies are immune to <Tip name="Stun" /> only.</p>
-                <p>Because bosses cannot be taunted, they always use the HP comparison above.</p>
+                <p>Taunt does not force a boss to attack one ally.</p>
               </div>
             </div>
             <div>
@@ -887,7 +888,7 @@ export default function App() {
                 { key: "spddown", name: <Tip name="SPD Down" />, value: "everyone else acts 43% more often" },
                 { key: "poison", name: <Tip name="Poison" />, value: "10% of max HP over 2 turns" },
                 { key: "dot", name: <><Tip name="Burn" /> / <Tip name="Bleed" /></>, value: "15% of attack each turn" },
-                { key: "stun", name: <Tip name="Stun" />, value: "skips the action, other debuffs stay" },
+                { key: "stun", name: <Tip name="Stun" />, value: "skips the action, and other debuffs stay" },
                 { key: "slumber", name: <Tip name="Slumber" />, value: "skips the action until the first hit" },
               ]} />
               <div className="mt-3 space-y-3 text-sm text-white/80">

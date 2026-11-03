@@ -7,19 +7,22 @@ const ATTACK_POWER_RATE = 1.871;
 const DODGE_DAMAGE = 0.75;
 const K = 2000;
 const CURVE_SPD = 2000;
+const f32 = Math.fround;
 const BOSS_HP = 27600;
-const LAND = 0.8;
 const BASE_CRIT = 0.15;
 const BASE_CDMG = 1.3;
 const BIG_HIT_RATE = 0.25;
+const CONQUER_BIG_HIT = 0.25;
 const BIG_HIT_ATTACK = 1.15;
 const PINCH_RATE = 0.03;
 const CONQUER_CRIT = 0.15;
-const CONQUER_HP = 80000;
-const BE_CONQUER_HP = 90000;
-const HEAL_HOLD = 0.5;
+const CONQUER_DODGE = 0.5;
+const BUILTIN_RESIST = 0.1;
+const HEAL_HOLD = 0.8;
+const ELITE_BASE = { hp: 20250, atk: 2734, defn: 6952, spd: 2700 };
 const TRIAL_STACK = 0.15;
 const TRIAL_IMMUNE = new Set(["Silence", "Stun", "Taunt", "TargetTaunt", "Sleep", "Poison"]);
+const TRIAL_BASE = { hp: 31050, atk: 4050, defn: 10112, spd: 3200 };
 const TRIAL_KIT: Record<string, { id: string; stage: number; hp: number; atk: number; defn: number; spd: number }> = {
   Ice: { id: "C01_SSR_002", stage: 47, hp: 1.075, atk: 1.17, defn: 1.06, spd: 1.09 },
   Fire: { id: "C02_SSR_001", stage: 48, hp: 1.025, atk: 0.7, defn: 1.06, spd: 1.23 },
@@ -52,6 +55,13 @@ function has(buffs: Buff[], fid: string) {
 
 function buffCount(buffs: Buff[]) {
   return buffs.reduce((n, b) => n + (statusOf(b.fid).buff ? 1 : 0), 0);
+}
+
+// Trial/AttackStack are typed buff:false (resident, uncleansable) but live shows them as
+// ATK Up and Fearless passive gates AoE basic on "any buffs" — count them for that gate.
+function bossSkillBuffed(buffs: Buff[]) {
+  if (buffCount(buffs) >= 1) return true;
+  return buffs.some((b) => /AttackStack/.test(b.fid));
 }
 
 function oldBuffCount(holder: AnyRec) {
@@ -152,28 +162,137 @@ function defnSplit(buffs: Buff[]) {
   return [up, Math.min(0.75, down)] as const;
 }
 
-function defFactor(defense: number, buffs: Buff[], pens: Record<number, number>) {
+function roundEven(n: number) {
+  if (!Number.isFinite(n)) return 0;
+  const lo = Math.floor(n);
+  const d = n - lo;
+  if (d < 0.5) return lo;
+  if (d > 0.5) return lo + 1;
+  return lo % 2 === 0 ? lo : lo + 1;
+}
+
+function reductionMultiplier(cuts: number[]) {
+  const positives = cuts.filter((x) => x >= 0);
+  const negatives = cuts.filter((x) => x < 0);
+  const positive = Math.max(0, ...positives);
+  const negative = negatives.reduce((a, b) => f32(a + b), 0);
+  return f32(1 - f32(positive + negative));
+}
+
+function defenceRateOf(buffs: Buff[]) {
   const [up, shred] = defnSplit(buffs);
+  return (1 + up) * (1 - shred);
+}
+
+// Client BattleCalculator order: trunc attack and defense, float32 at each step,
+// three pierce remainders with anti-pierce, then half-to-even on the integer.
+function rawSkillValue(p: {
+  attack: number;
+  attRate: number;
+  defence: number;
+  defenceRate: number;
+  penetrations: number[];
+  antiPenetrate?: number;
+  attackPowerRate: number;
+  conditionMultiplier: number;
+  conquerMultiplier: number;
+}, hit = 1) {
+  const anti = Math.max(0, f32(1 - (p.antiPenetrate || 0)));
+  const rem = [0, 1, 2].map((i) => Math.max(0, f32(1 - f32(f32(p.penetrations[i] || 0) * anti))));
+  let attack = f32(f32(p.attRate || 0) * f32(Math.trunc(p.attack || 0)));
+  let defence = f32(f32(p.defenceRate) * f32(Math.trunc(p.defence || 0)));
+  defence = f32(defence * rem[0]);
+  const pow = f32(f32(p.attackPowerRate) * f32(1));
+  attack = f32(attack);
+  defence = f32(defence * rem[1]);
+  attack = f32(attack * pow);
+  attack = f32(f32(p.conditionMultiplier) * attack);
+  defence = f32(defence * rem[2]);
+  attack = f32(f32(p.conquerMultiplier) * attack);
+  const numerator = f32(f32(hit) * attack);
+  const denominator = f32(f32(defence / f32(K)) + 1);
+  return f32(numerator / denominator);
+}
+
+export function directDamage(
+  attack: number,
+  defense: number,
+  mult = 1,
+  extra: {
+    rate?: number;
+    power?: number;
+    cond?: number;
+    conquer?: number;
+    pens?: Record<number, number>;
+    buffs?: Buff[];
+    cuts?: number[];
+    stealth?: boolean;
+    antiPenetrate?: number;
+  } = {},
+) {
+  const buffs = extra.buffs || [];
   const vuln = Math.max(0, magSum(buffs, "vuln"));
-  let penMult = 1;
-  for (const ch of [1, 2, 3]) penMult *= Math.max(0, 1 - Math.min(0.95, pens[ch] || 0));
-  defense = defense * (1 + up) * (1 - shred) * penMult;
-  return (K / (K + defense)) * (1 + vuln);
+  const cuts = [...(extra.cuts || [])];
+  if (vuln > 0) cuts.push(-vuln);
+  const pens = extra.pens || {};
+  let value = rawSkillValue({
+    attack,
+    attRate: extra.rate ?? 1,
+    defence: defense,
+    defenceRate: defenceRateOf(buffs),
+    penetrations: [pens[1] || 0, pens[2] || 0, pens[3] || 0],
+    antiPenetrate: extra.antiPenetrate,
+    attackPowerRate: extra.power ?? ATTACK_POWER_RATE,
+    conditionMultiplier: extra.cond ?? 1,
+    conquerMultiplier: extra.conquer ?? 1,
+  }, mult);
+  value = f32(value * reductionMultiplier(cuts));
+  if (extra.stealth) value = f32(value * f32(0.5));
+  return Math.max(0, roundEven(value));
+}
+
+export function dotDamage(snapshot: number, defense: number, buffs: Buff[] = []) {
+  const rate = f32(defenceRateOf(buffs));
+  const scaled = f32(f32(f32(Math.trunc(defense)) * rate) * f32(0.3));
+  let amount = f32(f32(f32(snapshot) * f32(ATTACK_POWER_RATE)) / f32(1 + f32(scaled / 2000)));
+  const vuln = Math.max(0, magSum(buffs, "vuln"));
+  amount = f32(amount * reductionMultiplier(vuln > 0 ? [-vuln] : []));
+  return Math.max(0, roundEven(amount));
 }
 
 function spd(base: number, buffs: Buff[]) {
   return Math.max(200, base * (1 + Math.max(-0.8, magSum(buffs, "spd"))));
 }
 
-function critMult(bonus = 0, critAdd = 0, cdmgAdd = 0, resist = 0) {
+function clearStat(holder: AnyRec, key: "spd" | "defn") {
+  const bonus = holder.clear_bonus;
+  if (!bonus || debuffN(holder) > 0) return holder[key];
+  return holder[key] * (1 + (bonus[key] || 0));
+}
+
+function rollLabel(mult: number) {
+  if (mult >= BASE_CDMG - 0.001) return "crit";
+  if (Math.abs(mult - BIG_HIT_ATTACK) < 0.001) return "big hit";
+  if (Math.abs(mult - DODGE_DAMAGE) < 0.001) return "glancing";
+  return "normal";
+}
+
+function hitRoll(rng: PyRandom, dodge: number, bonus = 0, critAdd = 0, cdmgAdd = 0, resist = 0, advantage = false) {
+  if (rng.random() <= dodge) return { mult: DODGE_DAMAGE, crit: false };
   const cr = Math.min(1, Math.max(0, BASE_CRIT + bonus + critAdd - resist));
-  const cd = BASE_CDMG + cdmgAdd;
-  const plain = 1 + BIG_HIT_RATE * (BIG_HIT_ATTACK - 1);
-  return cr * cd + (1 - cr) * plain;
+  if (rng.random() < cr) return { mult: BASE_CDMG + cdmgAdd, crit: true };
+  if (rng.random() < (advantage ? CONQUER_BIG_HIT : BIG_HIT_RATE)) return { mult: BIG_HIT_ATTACK, crit: false };
+  return { mult: 1, crit: false };
 }
 
 function dodgeChance(attacker: Buff[], target: Buff[]) {
   return magSum(target, "eva") - hitMod(attacker);
+}
+
+function effectGate(resist: number, hit = 0) {
+  const threshold = f32(f32(1 + f32(hit || 0)) - f32(resist || 0));
+  const cap = f32(1 - f32(BUILTIN_RESIST));
+  return Math.max(0, Math.min(1, Math.min(threshold, cap)));
 }
 
 const BEATS: Record<string, string> = { Fire: "Earth", Earth: "Ground", Ground: "Ice", Ice: "Fire" };
@@ -200,37 +319,28 @@ function upsert(list: Buff[], fid: string, mag: number, rounds: number, payload?
 function gainShield(who: AnyRec, amount: number, rounds?: number) {
   if (!(amount > 0)) return 0;
   const lasting = (rounds || 0) > 0 ? Math.round(rounds as number) : 2;
+  const gained = f32(amount);
   if (!who.shield_layers) who.shield_layers = [];
-  if ((who.shield_hp || 0) > 0) {
-    for (const layer of who.shield_layers) {
-      if (lasting > layer.rounds) {
-        layer.rounds = lasting;
-        layer.fresh = true;
-      }
-    }
-    return 0;
-  }
-  who.shield_hp = (who.shield_hp || 0) + amount;
-  who.shield_layers.push({ left: amount, rounds: lasting, fresh: !!who.ending });
-  return amount;
+  who.shield_hp = (who.shield_hp || 0) + gained;
+  who.shield_layers.push({ left: gained, rounds: lasting, fresh: !!who.ending });
+  return gained;
 }
 
 function absorbShield(who: AnyRec, amount: number) {
   if (!(amount > 0)) return 0;
-  let rest = amount;
-  const kept: { left: number; rounds: number; fresh: boolean }[] = [];
-  for (const layer of who.shield_layers || []) {
-    if (rest <= 0) {
-      kept.push(layer);
-      continue;
-    }
-    const use = Math.min(layer.left, rest);
-    layer.left -= use;
-    rest -= use;
-    if (layer.left > 1e-6) kept.push(layer);
+  const layers = who.shield_layers || [];
+  const layer = layers[0];
+  if (!layer) return 0;
+  let absorbed: number;
+  if (layer.left < amount) {
+    absorbed = roundEven(layer.left);
+    layers.shift();
+  } else {
+    absorbed = amount;
+    layer.left = f32(layer.left - amount);
+    if (layer.left <= 0) layers.shift();
   }
-  who.shield_layers = kept;
-  const absorbed = amount - rest;
+  who.shield_layers = layers;
   who.shield_hp = Math.max(0, (who.shield_hp || 0) - absorbed);
   return absorbed;
 }
@@ -279,11 +389,33 @@ function give(buffs: Buff[], st: AnyRec, fresh: Set<string> | null) {
   else if ((st.rounds || 0) > 0) rounds = st.rounds;
   else if ((st.rounds || 0) < 0 || row.resident) rounds = -1;
   else rounds = st.rounds || row.rounds || 2;
-  if (damages(st.fid) || st.fid === "ContinuousHeal") {
+  if (damages(st.fid)) {
     buffs.push({ fid: st.fid, mag: 1, rounds, payload: { ...(st.payload || {}), fresh: true } });
     return;
   }
+  // ContinuousHeal is a normal buff (maxStack 0): refresh duration, do not pile copies.
+  const maxStack = Number(row.maxStack || 0);
+  const add = Math.max(1, Number(st.count) || 1);
+  if (maxStack > 0) {
+    const existing = buffs.find((buff) => buff.fid === st.fid);
+    if (existing) {
+      const cur = Number((existing.payload || {}).stacks || existing.mag || 1);
+      existing.payload = { ...(existing.payload || {}), stacks: Math.min(maxStack, cur + add) };
+      existing.mag = 1;
+      existing.rounds = rounds;
+      if (fresh) fresh.add(st.fid);
+      return;
+    }
+    buffs.push({ fid: st.fid, mag: 1, rounds, payload: { ...(st.payload || {}), stacks: Math.min(maxStack, add) } });
+    if (fresh) fresh.add(st.fid);
+    return;
+  }
   keepOne(buffs, st.fid, rounds, fresh);
+}
+
+function stackFidFor(rate: number) {
+  if (!(rate > 0)) return "";
+  return rate >= 0.14 ? "Trial_AttackStack_2" : "AttackStack";
 }
 
 function stripBuffs(holder: AnyRec, count: number) {
@@ -399,12 +531,20 @@ function alliesFor(caster: AnyRec, aim: string, allies: AnyRec[]) {
   if (aim === "self" || !living.length) return [caster];
   if (aim === "lowest") return [living.reduce((best, a) => (a.hp / a.hp_max < best.hp / best.hp_max ? a : best))];
   if (aim === "lowest2") return living.slice().sort((a, b) => a.hp / a.hp_max - b.hp / b.hp_max).slice(0, 2);
-  return living;
+  if (aim === "highest") return highestAtk(caster, living, false);
+  if (aim === "allies" || aim === "") return living;
+  return [];
+}
+
+function highestAtk(caster: AnyRec, allies: AnyRec[], noself: boolean) {
+  const pool = allies.filter((a) => a.hp > 0 && (!noself || a !== caster));
+  if (!pool.length) return [];
+  return [pool.reduce((best, a) => (a.unit.atk > best.unit.atk ? a : best))];
 }
 
 function dotPlant(enemy: AnyRec, st: AnyRec, atk: number, ally: AnyRec) {
   const spec = statusOf(st.fid);
-  const raw = spec.dot === "poison" ? BOSS_HP * 0.05 * st.count : atk * (st.dot_rate ?? 0.15) * st.count;
+  const raw = spec.dot === "poison" ? (enemy.hp_max || 0) * 0.05 * st.count : f32(atk * (st.dot_rate ?? 0.15) * st.count);
   enemy.dots.push({ fid: st.fid, raw, rounds: st.rounds || 2, kind: spec.dot, owner: ally.unit.id });
 }
 
@@ -423,19 +563,19 @@ export function trialBoss(element = "") {
     id: kit.id,
     stage: kit.stage,
     name: unit?.name || kit.id,
-    hp: plain.hp * kit.hp,
-    atk: plain.atk * kit.atk,
-    defn: plain.defn * kit.defn,
-    spd: plain.spd * kit.spd,
+    hp: TRIAL_BASE.hp * kit.hp,
+    atk: TRIAL_BASE.atk * kit.atk,
+    defn: TRIAL_BASE.defn * kit.defn,
+    spd: TRIAL_BASE.spd * kit.spd,
     stack: TRIAL_STACK,
   };
 }
 
-export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, bossId = "plain", stopOnDeath = false, element = "", endOnKill = false, turnCap = TURNS, giveUp?: { rounds?: number; taken?: number; actions?: number }, hpScale = 1, trace?: string[]) {
+export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, bossId = "plain", stopOnDeath = false, element = "", endOnKill = false, turnCap = TURNS, giveUp?: { rounds?: number; taken?: number; actions?: number }, hpScale = 1, trace?: string[], foes?: AnyRec[]) {
   const boss = data.bosses[bossId] || data.bosses.plain;
   const trial = TRIAL_KIT[element];
   const trialUnit = trial ? data.units[trial.id]?.["5"] : null;
-  const bossHp = (trial ? boss.hp * trial.hp : boss.hp) * hpScale;
+  const bossHp = (trial ? TRIAL_BASE.hp * trial.hp : boss.hp) * hpScale;
   const allies = units.map((unit) => ({
     unit,
     hp: unit.hp,
@@ -465,6 +605,7 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     team: [] as AnyRec[],
     boss_hp: bossHp,
   }));
+  for (const ally of allies) ally.g = Math.floor(rng.random() * 5) / 100;
   let lost = false;
   const noteLoss = (ally: AnyRec) => {
     if (stopOnDeath && ally.hp <= 0) lost = true;
@@ -482,38 +623,78 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     }
   }
 
-  const makeEnemy = () => ({
-    hp: bossHp,
-    hp_max: bossHp,
-    g: 0,
-    buffs: [] as Buff[],
-    fresh: new Set<string>(),
-    dots: [] as AnyRec[],
-    kills: 0,
-    atk: trial ? boss.atk * trial.atk : boss.atk,
-    defn: trial ? boss.defn * trial.defn : boss.defn,
-    spd: trial ? boss.spd * trial.spd : boss.spd,
-    hurt: boss.hurt,
-    stack_rate: trial ? TRIAL_STACK : boss.stack_rate,
-    stacks: 0,
-    shield_hp: 0,
-    shield_layers: [] as { left: number; rounds: number; fresh: boolean }[],
-    ending: false,
-    basic: trialUnit?.basic || boss.basic,
-    ult: trial ? trialUnit?.ult || null : boss.ult,
-    cd: trial ? 0 : boss.cd,
-    buff_basic: trialUnit?.buff_basic || null,
-    basic_pen_ch: trialUnit?.basic_pen_ch || null,
-    adds: trialUnit?.adds || null,
-    procs: trialUnit?.basic_procs || null,
-    proc_cd: ((trialUnit?.basic_procs || []) as AnyRec[]).map(() => 0),
-    timed: trialUnit?.timed || null,
-    life: trialUnit?.life || null,
-    timed_cd: {} as Record<string, number>,
-    el: element,
-    immune: trial ? TRIAL_IMMUNE : null,
-  });
-  const enemies = Array.from({ length: nEnemies }, makeEnemy);
+  const makeEnemy = (over: AnyRec = {}) => {
+    const sheet = over.sheet || null;
+    const hp = over.hp != null ? over.hp : bossHp;
+    return {
+      hp,
+      hp_max: hp,
+      g: 0,
+      buffs: [] as Buff[],
+      fresh: new Set<string>(),
+      dots: [] as AnyRec[],
+      kills: 0,
+      atk: over.atk != null ? over.atk : trial ? TRIAL_BASE.atk * trial.atk : boss.atk,
+      defn: over.defn != null ? over.defn : trial ? TRIAL_BASE.defn * trial.defn : boss.defn,
+      spd: over.spd != null ? over.spd : trial ? TRIAL_BASE.spd * trial.spd : boss.spd,
+      hurt: over.hurt != null ? over.hurt : boss.hurt,
+      stack_rate: over.stack_rate != null ? over.stack_rate : trial ? TRIAL_STACK : boss.stack_rate,
+      stack_fid: over.stack_fid != null ? over.stack_fid : trial ? "Trial_AttackStack_2" : stackFidFor(over.stack_rate != null ? over.stack_rate : boss.stack_rate),
+      stacks: 0,
+      shield_hp: 0,
+      shield_layers: [] as { left: number; rounds: number; fresh: boolean }[],
+      ending: false,
+      basic: sheet ? sheet.basic : trialUnit?.basic || boss.basic,
+      ult: sheet ? sheet.ult || null : trial ? trialUnit?.ult || null : boss.ult,
+      cd: over.cd != null ? over.cd : trial || sheet ? 0 : boss.cd,
+      buff_basic: sheet ? sheet.buff_basic || null : trialUnit?.buff_basic || null,
+      basic_pen_ch: sheet ? sheet.basic_pen_ch || null : trialUnit?.basic_pen_ch || null,
+      adds: sheet ? sheet.adds || null : trialUnit?.adds || null,
+      procs: sheet ? sheet.basic_procs || null : trialUnit?.basic_procs || null,
+      proc_cd: ((sheet ? sheet.basic_procs : trialUnit?.basic_procs) || []).map(() => 0),
+      timed: sheet ? sheet.timed || null : trialUnit?.timed || null,
+      life: sheet ? sheet.life || null : trialUnit?.life || null,
+      timed_cd: {} as Record<string, number>,
+      name: over.name || "",
+      single_hurt: over.single_hurt || 0,
+      clear_bonus: over.clear_bonus || null,
+      el: over.el || element,
+      immune: over.immune !== undefined ? over.immune : trial ? TRIAL_IMMUNE : null,
+      debuff_res: over.debuff_res !== undefined ? over.debuff_res : trial ? 0.1 : null,
+      boss: over.boss !== undefined ? over.boss : true,
+      front_row: over.front_row !== undefined ? over.front_row : !!trial,
+      ult_needs_debuffs: !!over.ult_needs_debuffs,
+    };
+  };
+  const enemies = foes?.length
+    ? foes.map((over) => makeEnemy(over))
+    : Array.from({ length: nEnemies }, () => makeEnemy(trial && element === "Ice" ? { ult_needs_debuffs: true } : {}));
+  if (!foes?.length && trial && element === "Ground" && nEnemies === 1) {
+    const add = data.units.C04_SR_003?.["5"];
+    if (add) {
+      enemies.push(makeEnemy({
+        sheet: add,
+        hp: ELITE_BASE.hp * 0.615,
+        atk: ELITE_BASE.atk * 0.39,
+        defn: ELITE_BASE.defn * 0.826,
+        spd: ELITE_BASE.spd * 1.06,
+        el: "Earth",
+        hurt: 0,
+        stack_rate: 0,
+        stack_fid: "",
+        cd: 0,
+        immune: new Set(["Stun"]),
+        debuff_res: 0.1,
+        boss: false,
+        front_row: false,
+      }));
+    }
+  }
+  for (const enemy of enemies) enemy.g = Math.floor(rng.random() * 5) / 100;
+  const bossesDown = () => {
+    const bosses = enemies.filter((enemy) => enemy.boss);
+    return (bosses.length ? bosses : enemies).every((enemy) => enemy.hp <= 0);
+  };
   let primary = 0;
   let steps = 0;
   const counterDepth = [0];
@@ -540,6 +721,7 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
       if (row.need_same && ctx.diff) continue;
       if (row.need_noself && ctx.noself) continue;
       if (row.need_buff && !has(holder.buffs, row.need_buff)) continue;
+      if (row.hp_below != null && holder.hp_max && holder.hp / holder.hp_max >= row.hp_below) continue;
       if (row.debuff) {
         const [who, op, need] = row.debuff;
         const total = who === "enemies" ? enemies.filter((e) => e.hp > 0).reduce((s, e) => s + debuffN(e), 0) : debuffN(holder);
@@ -553,7 +735,8 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
           holder.g = Math.min(0.99, holder.g + effect.value);
           fired = true;
         } else if (op === "status") {
-          give(holder.buffs, effect, holder.fresh);
+          const chosen = effect.fids?.length ? { ...effect, fid: effect.fids[Math.floor(rng.random() * effect.fids.length)] } : effect;
+          give(holder.buffs, chosen, holder.fresh);
           fired = true;
         } else if (op === "shield" && effect.rate > 0) {
           const group = effect.aim === "allies"
@@ -573,8 +756,12 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
           holder.heal += gain;
           fired = true;
         } else if (op === "random" && effect.fids?.length) {
-          const fid = effect.fids[Math.floor(rng.random() * effect.fids.length)];
-          give(holder.buffs, { fid, rounds: effect.rounds || 1 }, holder.fresh);
+          const want = Math.max(1, Number(effect.rand || 1));
+          const pool = [...effect.fids];
+          for (let n = 0; n < want && pool.length; n++) {
+            const at = Math.floor(rng.random() * pool.length);
+            give(holder.buffs, { fid: pool.splice(at, 1)[0], rounds: effect.rounds || 1 }, holder.fresh);
+          }
           fired = true;
         } else if (op === "extend") {
           for (const enemy of enemies) {
@@ -637,9 +824,12 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     }
   }
 
-  function procOk(chance: number, resist: boolean) {
-    let p = chance < 0.999 ? chance : 1;
-    if (resist) p *= LAND;
+  function procOk(chance: number, resist: boolean, target?: AnyRec, hit = 0) {
+    let p = Math.max(0, Math.min(1, chance < 0.999 ? chance : 1));
+    if (resist) {
+      const res = target?.debuff_res != null ? Number(target.debuff_res) : Number(target?.unit?.debuff_res || 0);
+      p *= effectGate(res, hit);
+    }
     return rng.random() < p;
   }
 
@@ -655,11 +845,28 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     if (!pool.length) pool = living;
     const open = pool.filter((a) => !has(a.buffs, "Invincible"));
     pool = open.length ? open : pool;
-    const score = (ally: AnyRec) => {
-      const edge = elementEdge(enemy.el, ally.unit.el);
-      return ally.hp + (edge > 0 ? -CONQUER_HP : edge < 0 ? BE_CONQUER_HP : 0);
-    };
-    return pool.reduce((best, ally) => (score(ally) < score(best) ? ally : best));
+    if (enemy.front_row) {
+      if (rng.random() < 0.6) {
+        const front = pool.filter((a) => allies.indexOf(a) === 0);
+        if (front.length) pool = front;
+      }
+      const beaten = pool.filter((a) => elementEdge(enemy.el, a.unit.el) > 0);
+      if (beaten.length) pool = beaten;
+      const ratio = (a: AnyRec) => (a.hp_max > 0 ? a.hp / a.hp_max : 1);
+      let best = ratio(pool[0]);
+      let tied = [pool[0]];
+      for (const ally of pool.slice(1)) {
+        const rate = ratio(ally);
+        if (rate < best - 1e-9) {
+          best = rate;
+          tied = [ally];
+        } else if (Math.abs(rate - best) <= 1e-9) tied.push(ally);
+      }
+      if (tied.length === 1) return tied[0];
+      return rng.choice(tied);
+    }
+    if (pool.length === 1) return pool[0];
+    return rng.choice(pool);
   }
 
   function pickTargets(sk: AnyRec, fallback?: AnyRec[]) {
@@ -783,11 +990,18 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
       if (!gateOk(cl.gate, selectDied, hpBefore, ally)) return;
       if (!entryOk(snap, "cleanses", i, cl, ally, targets, allies)) return;
       if (cl.buff) {
-        const victims = cl.aim === "enemies" ? enemies.filter((e) => e.hp > 0) : targets.filter((e) => e.hp > 0);
-        for (const enemy of victims) {
-          const chance = cl.chance == null || cl.chance >= 0.999 ? 1 : cl.chance;
+        const chance = cl.chance == null || cl.chance >= 0.999 ? 1 : cl.chance;
+        let victims: AnyRec[];
+        if (["self", "allies", "lowest", "lowest2", "highest"].includes(cl.aim)) {
+          victims = alliesFor(ally, cl.aim, allies);
+        } else if (cl.aim === "enemies") {
+          victims = enemies.filter((e) => e.hp > 0);
+        } else {
+          victims = targets.filter((e) => e.hp > 0);
+        }
+        for (const holder of victims) {
           if (rng.random() >= chance) continue;
-          stripBuffs(enemy, cl.count ?? 1);
+          stripBuffs(holder, cl.count ?? 1);
         }
         return;
       }
@@ -803,25 +1017,35 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     (sk.statuses || []).forEach((st: AnyRec, i: number) => {
       if (!gateOk(st.gate, selectDied, hpBefore, ally)) return;
       if (st.need && st.need.who !== "target" && !entryOk(snap, "statuses", i, st, ally, targets, allies)) return;
-      if (st.fids?.length) st = { ...st, fid: st.fids[Math.floor(rng.random() * st.fids.length)] };
+      const rolls = (row: AnyRec) => {
+        if (!row.fids?.length) return [row];
+        const want = Math.max(1, Number(row.rand || 1));
+        const pool = [...row.fids];
+        const out: AnyRec[] = [];
+        for (let n = 0; n < want && pool.length; n++) {
+          const at = Math.floor(rng.random() * pool.length);
+          out.push({ ...row, fid: pool.splice(at, 1)[0] });
+        }
+        return out;
+      };
       const aim = st.aim || "hit";
-      if (["self", "allies", "lowest", "lowest2"].includes(aim)) {
+      if (["self", "allies", "lowest", "lowest2", "highest"].includes(aim)) {
         if (!procOk(st.chance, false)) return;
-        let who = alliesFor(ally, aim, allies);
+        let who = aim === "highest" ? highestAtk(ally, allies, !!st.noself) : alliesFor(ally, aim, allies);
         if (st.noself) who = who.filter((o) => o !== ally);
-        for (const other of who) give(other.buffs, st, other.fresh);
+        for (const other of who) for (const chosen of rolls(st)) give(other.buffs, chosen, other.fresh);
       } else {
         const victims = aim === "enemies" ? enemies.filter((e) => e.hp > 0) : targets.filter((e) => e.hp > 0);
-        for (const e of victims) {
+        for (const e of victims) for (const chosen of rolls(st)) {
           if (st.need && st.need.who === "target" && !needOk(st.need, ally, e, allies)) continue;
-          if (e.immune?.has(st.fid)) continue;
-          if (!st.is_buff && has(e.buffs, "Immune")) continue;
-          if (!procOk(st.chance, !st.is_buff)) continue;
-          const spec = statusOf(st.fid);
-          if (spec.dot) dotPlant(e, st, atkOf(ally), ally);
+          if (e.immune?.has(chosen.fid)) continue;
+          if (!chosen.is_buff && has(e.buffs, "Immune")) continue;
+          if (!procOk(chosen.chance, !chosen.is_buff, e, hitMod(ally.buffs))) continue;
+          const spec = statusOf(chosen.fid);
+          if (spec.dot) dotPlant(e, chosen, atkOf(ally), ally);
           else {
-            give(e.buffs, st, null);
-            if (st.fid === "Taunt") {
+            give(e.buffs, chosen, null);
+            if (chosen.fid === "Taunt") {
               const applied = (e.buffs as Buff[]).filter((buff) => buff.fid === "Taunt").pop();
               if (applied) applied.payload = { ...(applied.payload || {}), source: ally };
             }
@@ -834,8 +1058,14 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
       const aim = push.aim || push.side;
       const gains = push.value > 0 || (push.per_cleanse || 0) > 0;
       if (gains && (aim === "self" || aim === "hit") && push.side !== "enemy") {
+        if (push.noself && aim === "self") return;
         if (!entryOk(snap, "pushes", i, push, ally, targets, allies)) return;
         if (!has(ally.buffs, "Restrict")) ally.g = Math.min(0.99, ally.g + pushAmount(push, ally, ally));
+      } else if (gains && aim === "highest") {
+        if (!entryOk(snap, "pushes", i, push, ally, targets, allies)) return;
+        for (const other of highestAtk(ally, allies, !!push.noself)) {
+          if (!has(other.buffs, "Restrict")) other.g = Math.min(0.99, other.g + pushAmount(push, other, ally));
+        }
       } else if (gains && (aim === "lowest" || aim === "lowest2")) {
         if (!entryOk(snap, "pushes", i, push, ally, targets, allies)) return;
         for (const other of alliesFor(ally, aim, allies)) {
@@ -854,15 +1084,15 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
         for (const e of victims) {
           if (!entryOk(snap, "pushes", i, push, ally, e, allies)) continue;
           if (has(e.buffs, "Immune")) continue;
-          if (procOk(1, true)) e.g = Math.max(0, e.g + pushAmount(push, e, ally));
+          if (procOk(1, true, e)) e.g = Math.max(0, e.g + pushAmount(push, e, ally));
         }
       }
     });
   }
 
   function bossAtk(enemy: AnyRec) {
-    const bonus = magSum(enemy.buffs, "atk") + enemy.stacks * enemy.stack_rate;
-    return enemy.atk * Math.max(0.2, 1 + bonus);
+    // Trial / AttackStack stacks live on the buff (payload.stacks) via give()+maxStack.
+    return enemy.atk * Math.max(0.2, 1 + magSum(enemy.buffs, "atk"));
   }
 
   function cooling(holder: AnyRec, sid: string) {
@@ -1075,9 +1305,21 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
   function strikeAlly(enemy: AnyRec, ally: AnyRec, rate: number, sk?: AnyRec, pens?: Record<number, number>) {
     if (ally.hp <= 0) return;
     const edge = elementEdge(enemy.el, ally.unit.el);
-    const mult = rng.random() <= dodgeChance(enemy.buffs, ally.buffs) + (edge < 0 ? 0.5 : 0) ? DODGE_DAMAGE : critMult(edge > 0 ? CONQUER_CRIT : 0, magSum(enemy.buffs, "crit"), magSum(enemy.buffs, "cdmg"), magSum(ally.buffs, "cres"));
-    let raw = bossAtk(enemy) * rate * mult * defFactor(allyDef(ally), ally.buffs, pens || { 1: 0, 2: 0, 3: 0 }) * (edge > 0 ? 1.1 : 1);
-    raw *= Math.max(0, 1 - hurtCut(ally, sk || null)) * ATTACK_POWER_RATE * (has(ally.buffs, "Stealth") && sk && sk.tgt === "All" ? 0.5 : 1);
+    // Boss→ally: evasion only. Ally ACC Down / conquer-dodge do not soften boss swings (live Ice tanks still eat full Fire hits).
+    const dodge = Math.max(0, magSum(ally.buffs, "eva"));
+    const rolled = hitRoll(rng, dodge, edge > 0 ? CONQUER_CRIT : 0, magSum(enemy.buffs, "crit"), magSum(enemy.buffs, "cdmg"), magSum(ally.buffs, "cres"), edge > 0);
+    const mult = rolled.mult;
+    const covered = hurtCut(ally, sk || null);
+    // Story enemies use AttackPowerRate. Trial bosses do not.
+    let raw = directDamage(bossAtk(enemy), allyDef(ally), mult, {
+      rate,
+      power: trial ? 1 : ATTACK_POWER_RATE,
+      pens: pens || { 1: 0, 2: 0, 3: 0 },
+      buffs: ally.buffs,
+      conquer: edge > 0 ? 1.1 : 1,
+      cuts: covered > 0 ? [covered] : [],
+      stealth: !!(has(ally.buffs, "Stealth") && sk && sk.tgt === "All"),
+    });
     if (has(ally.buffs, "SkillNullifier")) {
       ally.buffs = (ally.buffs as Buff[]).filter((b) => b.fid !== "SkillNullifier");
       raw = 0;
@@ -1096,7 +1338,7 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
         }
       }
       if (sharer && shareRate > 0) {
-        const moved = raw * shareRate;
+        const moved = Math.min(raw, roundEven(f32(raw * shareRate)));
         raw -= moved;
         const movedAbsorbed = absorbShield(sharer, moved);
         const movedHp = moved - movedAbsorbed;
@@ -1113,15 +1355,28 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     const absorbed = absorbShield(ally, raw);
     const hit = raw;
     raw -= absorbed;
+    const beforeHp = ally.hp;
     ally.hp = Math.max(0, ally.hp - raw);
     ally.taken += raw;
+    const lost = beforeHp - ally.hp;
+    const bounce = ally.unit.reflect;
+    if (bounce && ally.hp > 0 && lost > 0) {
+      const back = Math.min(lost * bounce.rate, ally.hp_max * (bounce.cap ?? 1));
+      if (back > 0) {
+        const bounced = absorbShield(enemy, back);
+        enemy.hp -= back - bounced;
+        if (enemy.hp <= 0) bossSurvive(enemy);
+        if (immortal(enemy) && enemy.hp < 1) enemy.hp = 1;
+        noteDamage(ally, back);
+      }
+    }
     if (hit > 0) {
       wakeSleep(ally);
       breakStealth(ally);
     }
     survive(ally);
     noteLoss(ally);
-    if (trace && hit > 0) trace.push(`turn ${primary}  boss hit ${ally.unit.name}  ${Math.round(hit)} damage  ${Math.round(ally.hp)} hp left`);
+    if (trace && hit > 0) trace.push(`turn ${primary}  ${enemy.name || "boss"} hit ${ally.unit.name}  ${Math.round(hit)} damage ${rollLabel(mult)}  ${Math.round(ally.hp)} hp left`);
     if (sk && sk.rate > 0) {
       answerHit(enemy, ally, sk);
       runRows(ally, "targeted", { diff: true, damage: true, tgt: sk.tgt || "One", attacker: enemy, noself: false });
@@ -1129,22 +1384,24 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
   }
 
   function giveBossBuff(enemy: AnyRec, fid: string, rounds: number) {
-    if (statusOf(fid).inStat) give(enemy.buffs, { fid, rounds }, enemy.fresh);
-    else {
-      upsert(enemy.buffs, fid, 1, rounds || 2);
-      enemy.fresh.add(fid);
-    }
+    give(enemy.buffs, { fid, rounds }, enemy.fresh);
+  }
+
+  function tickBossStack(enemy: AnyRec) {
+    const fid = enemy.stack_fid || stackFidFor(enemy.stack_rate);
+    if (!fid) return;
+    give(enemy.buffs, { fid, count: 1 }, enemy.fresh);
   }
 
   function plantOnAlly(enemy: AnyRec, ally: AnyRec, effect: AnyRec) {
     const fid = effect.fid;
     if (isDebuff(fid) && has(ally.buffs, "Immune")) return;
-    const chance = effect.chance < 0.999 ? effect.chance : 1;
-    const land = isDebuff(fid) ? Math.min(0.85, 1 - Number(ally.unit.debuff_res || 0)) : Math.min(0.85, 1);
+    const chance = Math.max(0, Math.min(1, effect.chance < 0.999 ? effect.chance : 1));
+    const land = isDebuff(fid) ? effectGate(Number(ally.unit.debuff_res || 0)) : 1;
     if (rng.random() >= chance * land) return;
     if (fid === "Poison" || fid === "Bleed" || fid === "Burn") {
       const kind = statusOf(fid).dot;
-      const raw = kind === "poison" ? ally.hp_max * 0.05 * effect.count : bossAtk(enemy) * effect.rate * effect.count;
+      const raw = kind === "poison" ? ally.hp_max * 0.05 * effect.count : f32(bossAtk(enemy) * effect.rate * effect.count);
       ally.dots.push({ fid, raw, rounds: effect.rounds, kind });
       return;
     }
@@ -1161,20 +1418,34 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     const targets = force != null ? force.filter((e) => e.hp > 0) : pickTargets(sk, fallback);
     const hpBefore = targets.length ? targets[0].hp : BOSS_HP;
     const atk = atkOf(ally);
+    let critLanded = false;
     if (targets.length && sk.rate > 0) {
       const preEnemies = enemies.filter((e) => e.hp > 0).length;
       for (const e of targets) {
         const [rate, pens, cond] = rateOf(ally, sk, e, isBasic, preEnemies);
-        const cut = e.hp > e.hp_max * 0.5 ? e.hurt : 0;
+        const cuts: number[] = [];
+        if (e.hp > e.hp_max * 0.5 && e.hurt > 0) cuts.push(e.hurt);
+        if (e.single_hurt > 0 && sk.tgt !== "All" && sk.tgt !== "RandomTwo") cuts.push(e.single_hurt);
         const edge = sk.force_advantage ? 1 : elementEdge(ally.unit.el, e.el);
-        const crit = critMult(ally.unit.perm_crit + (sk.crit || 0) + (edge > 0 ? CONQUER_CRIT : 0), magSum(ally.buffs, "crit"), magSum(ally.buffs, "cdmg"), magSum(e.buffs, "cres"));
-        const mult = rng.random() <= dodgeChance(ally.buffs, e.buffs) + (edge < 0 ? 0.5 : 0) ? DODGE_DAMAGE : crit;
-        const dealt = atk * rate * cond * defFactor(e.defn, e.buffs, pens) * mult * (1 - cut) * ATTACK_POWER_RATE * (edge > 0 ? 1.1 : 1) * (has(e.buffs, "Stealth") && sk.tgt === "All" ? 0.5 : 1);
+        const dodge = dodgeChance(ally.buffs, e.buffs) + (edge < 0 ? CONQUER_DODGE : 0);
+        const rolled = hitRoll(rng, dodge, ally.unit.perm_crit + (sk.crit || 0) + (edge > 0 ? CONQUER_CRIT : 0), magSum(ally.buffs, "crit"), magSum(ally.buffs, "cdmg"), magSum(e.buffs, "cres"), edge > 0);
+        const mult = rolled.mult;
+        if (rolled.crit) critLanded = true;
+        const dealt = directDamage(atk, clearStat(e, "defn"), mult, {
+          rate,
+          cond,
+          pens,
+          buffs: e.buffs,
+          conquer: edge > 0 ? 1.1 : 1,
+          cuts,
+          stealth: !!(has(e.buffs, "Stealth") && sk.tgt === "All"),
+        });
         const absorbed = absorbShield(e, dealt);
         e.hp -= dealt - absorbed;
         if (e.hp <= 0) bossSurvive(e);
+        if (immortal(e) && e.hp < 1) e.hp = 1;
         noteDamage(ally, dealt);
-        if (trace && dealt > 0) trace.push(`turn ${primary}  ${ally.unit.name} ${isBasic ? "basic" : "ultimate"}  ${Math.round(dealt)} damage  boss ${Math.max(0, Math.round(e.hp))}`);
+        if (trace && dealt > 0) trace.push(`turn ${primary}  ${ally.unit.name} ${isBasic ? "basic" : "ultimate"}  ${Math.round(dealt)} damage ${rollLabel(mult)}  ${e.name ? e.name + " " : ""}boss ${Math.max(0, Math.round(e.hp))}`);
         if (dealt > 0) {
           wakeSleep(e);
           breakStealth(e);
@@ -1182,6 +1453,8 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
         }
         if (depth === 0 && has(e.buffs, "Counterattack")) strikeAlly(e, ally, 1);
       }
+    } else if (trace && depth === 0) {
+      trace.push(`turn ${primary}  ${ally.unit.name} ${isBasic ? "basic" : "ultimate"}`);
     }
     const selectDied = targets.length > 0 && targets[0].hp <= 0;
     const snap = snapshotNeeds(ally, sk, targets, allies);
@@ -1208,13 +1481,25 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
         justKilled = true;
         onDead();
         e.kills += 1;
-        if (endOnKill) lost = enemies.every((enemy) => enemy.hp <= 0);
+        if (endOnKill) lost = bossesDown();
         else e.hp = e.hp_max;
       }
     }
     ally.just_killed = justKilled;
     if (sk.rate > 0 && !has(ally.buffs, "Restrict")) {
-      for (const push of ally.unit.attack_pushes || []) ally.g = Math.min(0.99, ally.g + (push.value || 0));
+      for (const push of ally.unit.attack_pushes || []) {
+        if (push.crit && !critLanded) continue;
+        ally.g = Math.min(0.99, ally.g + (push.value || 0));
+      }
+    }
+    if (fromPinch && !has(ally.buffs, "Restrict")) {
+      for (const push of ally.unit.pinch_pushes || []) {
+        const group = push.aim === "allies" ? allies.filter((a) => a.hp > 0) : [ally];
+        for (const other of group) {
+          if (push.noself && other === ally) continue;
+          if (!has(other.buffs, "Restrict")) other.g = Math.min(0.99, other.g + (push.value || 0));
+        }
+      }
     }
     if (isBasic && depth === 0 && !fromPinch && targets.length) baseFlanks(ally, targets);
     return targets;
@@ -1233,9 +1518,8 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
   }
 
   function tickAllyDots(ally: AnyRec) {
-    const factor = defFactor(allyDef(ally), ally.buffs, { 1: 0, 2: 0, 3: 0 });
     for (const dot of ally.dots) {
-      let amount = dot.kind === "poison" ? dot.raw : dot.raw * factor;
+      let amount = dot.kind === "poison" ? Math.trunc(dot.raw) : dotDamage(dot.raw, allyDef(ally), ally.buffs);
       const absorbed = absorbShield(ally, amount);
       amount -= absorbed;
       ally.hp = Math.max(0, ally.hp - amount);
@@ -1250,7 +1534,7 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
 
   function explodeBomb(ally: AnyRec, bomb: Buff) {
     const payload = bomb.payload || {};
-    let raw = (payload.atk || 0) * (payload.rate ?? 0.25);
+    let raw = Math.max(0, roundEven(f32((payload.atk || 0) * (payload.rate ?? 0.25))));
     const absorbed = absorbShield(ally, raw);
     raw -= absorbed;
     ally.hp = Math.max(0, ally.hp - raw);
@@ -1453,8 +1737,8 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
         if (proc.extra) {
           fired = true;
           ally.actions += 1;
-          cast(ally, ally.cd <= 0 && unit.ult ? unit.ult : unit.basic, ally.cd > 0 || !unit.ult, 0);
-          if (unit.ult && ally.cd <= 0) ally.cd = Math.max(1, unit.ult.cd - 1);
+          const follow = unit.buff_basic && buffCount(ally.buffs) >= 1 ? unit.buff_basic : unit.basic;
+          cast(ally, follow, true, 0);
           ally.g = 0;
         }
         if (fired && proc.cd) ally.proc_cd[i] = proc.cd;
@@ -1502,6 +1786,7 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     ally.buffs = kept;
     ally.fresh.clear();
     tickShields(ally);
+    noteGauges();
   }
 
   function bossTargets(enemy: AnyRec, sk: AnyRec) {
@@ -1567,13 +1852,30 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
         }
       }
       if (fired && row.cd_key) enemy.timed_cd[row.cd_key] = row.cd_after;
-      if (enemy.hp > 0) return;
+      if (enemy.hp > 0) {
+        // Paired Endure: life "before"/timed rows that need Immortal_Mark (Fearless once-per-battle).
+        for (const follow of enemy.life || []) {
+          if (follow.when !== "before" || !follow.need_buff || !has(enemy.buffs, follow.need_buff)) continue;
+          for (const effect of follow.effects || []) {
+            if (effect.op === "status") give(enemy.buffs, effect, enemy.fresh);
+          }
+        }
+        for (const follow of enemy.timed || []) {
+          if (follow.when !== "targeted" || !follow.need_buff || !has(enemy.buffs, follow.need_buff)) continue;
+          for (const effect of follow.effects || []) {
+            if (effect.op === "status") give(enemy.buffs, effect, enemy.fresh);
+          }
+        }
+        return;
+      }
     }
   }
 
   function bossStruck(enemy: AnyRec) {
     for (const row of enemy.timed || []) {
-      if (row.when !== "targeted" || !row.need_damage) continue;
+      if (row.when !== "targeted") continue;
+      // Hit reactions: need_damage basics, or need_buff followups (Immortal_Mark → Immortal).
+      if (!row.need_damage && !row.need_buff) continue;
       if (row.cd_key && (enemy.timed_cd[row.cd_key] || 0) >= 1) continue;
       if (row.need_buff && !has(enemy.buffs, row.need_buff)) continue;
       let fired = false;
@@ -1604,6 +1906,12 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
       strikeAlly(enemy, ally, rate * cond, sk, pens);
     }
     fireReactions("after_skill", enemy, sk, targets);
+    // Fearless ult: extend existing self buffs by 1 before granting the new ATK Up.
+    if (sk === enemy.ult && (sk.statuses || []).some((row: AnyRec) => row.fid === "AddAttack" && row.aim === "self")) {
+      for (const buff of enemy.buffs as Buff[]) {
+        if (buff.rounds > 0 && statusOf(buff.fid).buff) buff.rounds += 1;
+      }
+    }
     for (const effect of bossEffects(sk)) {
       const aim = effect.aim;
       if (["self", "allies", "lowest", "lowest2", "other"].includes(aim)) {
@@ -1636,7 +1944,7 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
       } else if (push.value < 0) {
         for (const ally of targets) {
           if (has(ally.buffs, "Immune")) continue;
-          if (rng.random() < Math.min(0.85, 1)) ally.g = Math.max(0, ally.g + push.value);
+          ally.g = Math.max(0, ally.g + push.value);
         }
       }
     }
@@ -1676,10 +1984,8 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
 
   function enemyAct(enemy: AnyRec, idx: number) {
     beforeRounds();
-    if (enemy.stack_rate) enemy.stacks += 1;
-    const factor = defFactor(enemy.defn, enemy.buffs, { 1: 0, 2: 0, 3: 0 });
     for (const dot of enemy.dots) {
-      let amount = dot.kind === "poison" ? dot.raw : dot.raw * factor;
+      let amount = dot.kind === "poison" ? Math.trunc(dot.raw) : dotDamage(dot.raw, clearStat(enemy, "defn"), enemy.buffs);
       const absorbed = absorbShield(enemy, amount);
       amount -= absorbed;
       enemy.hp -= amount;
@@ -1696,8 +2002,9 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
       if (enemy.hp <= 0) {
         onDead();
         enemy.kills += 1;
+        enemy.g = 0;
         if (endOnKill) {
-          lost = true;
+          lost = bossesDown();
           return;
         }
         enemy.hp = enemy.hp_max;
@@ -1710,13 +2017,19 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
       fireReactions("after_round", enemy, null, []);
       return;
     }
-    const useUlt = enemy.cd <= 0 && enemy.ult && !has(enemy.buffs, "Silence") && ultFavored(enemy.ult, enemies, allies);
+    // Stack only when the boss actually swings (not while slept/stunned).
+    tickBossStack(enemy);
+    let useUlt = enemy.cd <= 0 && enemy.ult && !has(enemy.buffs, "Silence") && ultFavored(enemy.ult, enemies, allies);
+    if (useUlt && enemy.ult_needs_debuffs) {
+      const debuffs = allies.reduce((sum, ally) => sum + (ally.hp > 0 ? debuffN(ally) : 0), 0);
+      if (!(debuffs > 1)) useUlt = false;
+    }
     let sk: AnyRec | null;
     if (useUlt) {
       sk = enemy.ult;
       enemy.cd = Math.max(1, sk.cd - 1);
     } else {
-      sk = enemy.buff_basic && buffCount(enemy.buffs) >= 1 ? enemy.buff_basic : enemy.basic;
+      sk = enemy.buff_basic && bossSkillBuffed(enemy.buffs) ? enemy.buff_basic : enemy.basic;
       if (enemy.cd > 0) enemy.cd -= 1;
     }
     enemy.g = 0;
@@ -1733,7 +2046,7 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
         kept.push(b);
         continue;
       }
-      if (enemy.fresh.has(b.fid)) {
+      if (enemy.fresh.has(b.fid) || b.rounds < 0) {
         kept.push(b);
         continue;
       }
@@ -1745,6 +2058,17 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     tickShields(enemy);
     if (idx === 0) primary += 1;
     fireReactions("after_round", enemy, sk, []);
+    noteGauges();
+  }
+
+  function noteGauges() {
+    if (!trace) return;
+    const bar = (name: string, g: number) => `${name} ${Math.round(g * 100)}%`;
+    const parts = [
+      ...allies.filter((a) => a.hp > 0).map((a) => bar(a.unit.name, a.g)),
+      ...enemies.filter((e) => e.hp > 0).map((e) => bar(e.name || "enemy", e.g)),
+    ];
+    trace.push(`gauges  ${parts.join("  ")}`);
   }
 
   for (const ally of allies) {
@@ -1767,6 +2091,7 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     if (giveUp.actions != null && actions < giveUp.actions) return false;
     return giveUp.taken != null && taken > giveUp.taken;
   };
+  noteGauges();
   while (primary < turnCap && steps < 8000 && !lost) {
     if (pastGiveUp()) {
       pruned = true;
@@ -1781,7 +2106,7 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     }
     let enemy: AnyRec | null = null;
     let enemyIndex = 0;
-    for (let i = 0; i < enemies.length; i++) if (enemies[i].g >= 1 - 1e-7) { enemy = enemies[i]; enemyIndex = i; break; }
+    for (let i = 0; i < enemies.length; i++) if (enemies[i].hp > 0 && enemies[i].g >= 1 - 1e-7) { enemy = enemies[i]; enemyIndex = i; break; }
     if (enemy) {
       enemyAct(enemy, enemyIndex);
       continue;
@@ -1793,15 +2118,15 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
       const t = (1 - a.g) / (spd(a.unit.spd, a.buffs) / CURVE_SPD);
       if (t < dt) dt = t;
     }
-    for (const e of enemies) {
+    for (const e of enemies) if (e.hp > 0) {
       waiting = true;
-      const t = (1 - e.g) / (spd(e.spd, e.buffs) / CURVE_SPD);
+      const t = (1 - e.g) / (spd(clearStat(e, "spd"), e.buffs) / CURVE_SPD);
       if (t < dt) dt = t;
     }
     if (!waiting) break;
     dt = Math.max(0, dt);
     for (const a of allies) if (a.hp > 0) a.g += dt * (spd(a.unit.spd, a.buffs) / CURVE_SPD);
-    for (const e of enemies) e.g += dt * (spd(e.spd, e.buffs) / CURVE_SPD);
+    for (const e of enemies) if (e.hp > 0) e.g += dt * (spd(clearStat(e, "spd"), e.buffs) / CURVE_SPD);
   }
 
   return {

@@ -1,15 +1,12 @@
 import assert from "assert";
-import { fightOnce, trialBoss } from "./fight";
+import { directDamage, fightOnce, trialBoss } from "./fight";
 import { PyRandom } from "./random";
 
 const data = (globalThis as { __KAMI: any }).__KAMI;
-const K = 2000;
 const BOSS_DEF = 7680;
-const POWER = 1.871;
-const CRIT = 0.15 * 1.3 + 0.85 * (1 + 0.25 * (1.15 - 1));
 
-function hit(atk: number, defense = BOSS_DEF, crit = CRIT) {
-  return atk * (K / (K + defense)) * crit * POWER;
+function hit(atk: number, defense = BOSS_DEF, mult = 1) {
+  return directDamage(atk, defense, mult);
 }
 
 function blank(id: string, extra: Record<string, unknown> = {}) {
@@ -67,70 +64,72 @@ function test(name: string, fn: () => void) {
   tests.push([name, fn]);
 }
 
-test("a plain basic uses defense, the 1.871 multiplier, and the crit and big-hit average", () => {
-  const one = fight([blank("solo")]);
-  assert.equal(one.units[0].actions, 30);
+test("a plain basic rolls a graze, a normal hit, a big hit, or a crit", () => {
+  const trace: string[] = [];
+  const one = fightOnce([blank("solo")], 1, new PyRandom(1), "plain", false, "", false, 30, undefined, 1, trace);
   assert.equal(one.units[0].ults, 0);
-  assert.ok(Math.abs(one.damage - 30 * hit(3000)) < 1e-6);
+  const hits = trace.filter((line) => line.includes("solo basic")).map((line) => Number(line.match(/(\d+) damage/)?.[1]));
+  assert.equal(hits.length, one.units[0].actions);
+  assert.ok(one.units[0].actions >= 28);
+  for (const dealt of hits) {
+    assert.ok([0.75, 1, 1.15, 1.3].some((mult) => dealt === hit(3000, BOSS_DEF, mult)));
+  }
+  assert.ok(new Set(hits).size > 1);
 });
 
 test("full crit replaces the average with 1.3 crit damage", () => {
   const one = fight([blank("crit", { perm_crit: 1 })]);
-  assert.ok(Math.abs(one.damage - 30 * hit(3000, BOSS_DEF, 1.3)) < 1e-6);
+  assert.equal(one.damage, one.units[0].actions * hit(3000, BOSS_DEF, 1.3));
 });
 
-test("element advantage adds 1.1 damage and 15% crit, and the weaker element is dodged", () => {
+test("element advantage adds 1.1 damage and 15% crit, and the weak element eats more boss damage", () => {
   const tank = { hp: 5_000_000, defn: 500_000 };
   const stronger = fight([blank("solo", { ...tank, el: "Ice" })], "Fire");
   const even = fight([blank("solo", { ...tank, el: "Ground" })], "Fire");
   assert.ok(stronger.damage > even.damage);
-  assert.ok(stronger.taken < even.taken);
   const weaker = fight([blank("solo", { ...tank, el: "Earth" })], "Fire");
   assert.ok(weaker.damage < even.damage);
+  // Fire conquers Earth: boss hits land harder. Resist element does not get a free dodge on boss swings.
   assert.ok(weaker.taken > even.taken);
+  assert.ok(weaker.taken > stronger.taken);
 });
 
-test("the boss scores the element it beats 80000 lower and the element that beats it 90000 higher", () => {
+test("a trial boss aims at slot 1, then the element it beats", () => {
   const tank = { hp: 5_000_000, defn: 500_000 };
-  const hunted = fight([blank("ice", { ...tank, el: "Ice" }), blank("earth", { ...tank, el: "Earth" })], "Fire");
-  assert.ok(hunted.units.find((unit) => unit.id === "earth").taken > hunted.units.find((unit) => unit.id === "ice").taken);
-  const avoided = fight([blank("ice", { ...tank, el: "Ice" }), blank("ground", { ...tank, el: "Ground" })], "Fire");
-  assert.ok(avoided.units.find((unit) => unit.id === "ground").taken > avoided.units.find((unit) => unit.id === "ice").taken);
-  const gap = fight([blank("ice", { ...tank, el: "Ice", hp: 5_000_000 }), blank("earth", { ...tank, el: "Earth", hp: 5_200_000 })], "Fire");
-  assert.ok(gap.units.find((unit) => unit.id === "ice").taken > gap.units.find((unit) => unit.id === "earth").taken);
-  const plainAim = fight([blank("ice", { el: "Ice", hp: 8_000_000 }), blank("earth", { el: "Earth", hp: 9_000_000 })]);
-  assert.ok(plainAim.units.find((unit) => unit.id === "ice").taken > 0);
-  assert.equal(plainAim.units.find((unit) => unit.id === "earth").taken, 0);
+  const mixed = fight([blank("earth", { ...tank, el: "Earth" }), blank("ice", { ...tank, el: "Ice" })], "Fire");
+  assert.ok(mixed.units[0].taken > mixed.units[1].taken);
 });
 
 test("50% pierce halves defense before the K formula", () => {
-  const unit = blank("pierce");
+  const unit = blank("pierce", { perm_crit: 1 });
   unit.basic = { ...unit.basic, pens: [{ channel: 1, base: 0.5 }] };
   const one = fight([unit]);
-  assert.ok(Math.abs(one.damage - 30 * hit(3000, BOSS_DEF * 0.5)) < 1e-6);
+  assert.equal(one.damage, one.units[0].actions * hit(3000, BOSS_DEF * 0.5, 1.3));
 });
 
 test("each other ally flanks a basic at their flank rate", () => {
-  const caller = blank("caller");
-  const partner = blank("partner", { pinch_rate: 1 });
+  const caller = blank("caller", { perm_crit: 1 });
+  const partner = blank("partner", { pinch_rate: 1, perm_crit: 1 });
   const flanked = fight([caller, partner]);
-  const plain = fight([blank("a"), blank("b")]);
-  assert.equal(flanked.units[0].actions, 30);
-  assert.equal(flanked.units[1].actions, 30);
-  assert.ok(Math.abs(flanked.damage - plain.damage * 1.5) < 1e-6);
+  const plain = fight([blank("a", { perm_crit: 1 }), blank("b", { perm_crit: 1 })]);
+  const swing = hit(3000, BOSS_DEF, 1.3);
+  const expected = swing * (flanked.units[0].actions * 2 + flanked.units[1].actions);
+  assert.equal(flanked.damage, expected);
+  assert.ok(flanked.damage > plain.damage);
 });
 
 test("a 100% skill flank adds one extra basic from the partner", () => {
-  const caller = blank("caller");
+  const caller = blank("caller", { perm_crit: 1 });
   caller.basic = {
     ...caller.basic,
     pinches: [{ chance: 1, who: "random", noself: true, gate: null }],
   };
-  const pinched = fight([caller, blank("partner")]);
-  const plain = fight([blank("a"), blank("b")]);
-  assert.equal(pinched.units[0].actions, 30);
-  assert.equal(pinched.units[1].actions, 30);
-  assert.ok(Math.abs(pinched.damage - plain.damage * 1.5) < 1e-6);
+  const pinched = fight([caller, blank("partner", { perm_crit: 1 })]);
+  const plain = fight([blank("a", { perm_crit: 1 }), blank("b", { perm_crit: 1 })]);
+  const swing = hit(3000, BOSS_DEF, 1.3);
+  const expected = swing * (pinched.units[0].actions * 2 + pinched.units[1].actions);
+  assert.equal(pinched.damage, expected);
+  assert.ok(pinched.damage > plain.damage);
 });
 
 test("the plain boss and the level-80 curves match the client tables", () => {
@@ -187,9 +186,12 @@ test("element bosses are the phantom trial units and neutral stays plain", () =>
   const ice = trialBoss("Ice");
   assert.equal(ice.name, "Lingering Warmth");
   assert.equal(ice.stage, 47);
-  assert.equal(ice.hp, 27600 * 1.075);
-  assert.equal(ice.atk, 3600 * 1.17);
+  assert.ok(Math.abs(ice.hp - 33379) < 1);
+  assert.equal(ice.atk, 4050 * 1.17);
   assert.equal(trialBoss("Fire").name, "Fearless Protection");
+  assert.ok(Math.abs(trialBoss("Fire").hp - 31826) < 1);
+  assert.ok(Math.abs(trialBoss("Earth").hp - 32602) < 1);
+  assert.ok(Math.abs(trialBoss("Ground").hp - 31826) < 1);
   assert.equal(trialBoss("Earth").name, "Hushaby Kiss");
   assert.equal(trialBoss("Ground").name, "Smoke and Flowers");
   const soft = blank("soft", { hp: 500000, atk: 1, defn: 0, spd: 100 });
@@ -199,7 +201,72 @@ test("element bosses are the phantom trial units and neutral stays plain", () =>
   const glass = { hp: 1, atk: 1, defn: 0, spd: 1 };
   const held = fight([blank("held", glass)], "Ice");
   const marked = fight([blank("marked", { ...glass, start_statuses: [{ fid: "ReduceSpeed", chance: 1, rounds: 5 }] })], "Ice");
-  assert.ok(Math.abs(marked.units[0].taken / held.units[0].taken - 1.44) < 0.02);
+  assert.equal(marked.units[0].taken, held.units[0].taken);
+});
+
+test("trial Fire boss hits allies without AttackPowerRate and stacks on the swing", () => {
+  const tank = blank("tank", { hp: 5_000_000, atk: 0, defn: 1701, spd: 1, el: "Ground" });
+  const trace: string[] = [];
+  fightOnce([tank], 1, new PyRandom(1), "plain", false, "Fire", false, 5, undefined, 1, trace);
+  const hits = trace.filter((line) => line.includes("boss hit")).map((line) => Number(line.match(/(\d+) damage/)?.[1]));
+  assert.ok(hits.length >= 2, "expected boss hits");
+  // Opens with ult (rate 1.44) at one +15% stack. No AttackPowerRate.
+  assert.ok(Math.abs(hits[0] - 2537) < 2, `first hit ${hits[0]}`);
+  // The ult's ATK Up turns the next swing into the 0.8 AoE. Two stacks plus that +20% crits for 2390, under the ult.
+  assert.ok(Math.abs(hits[1] - 2390) < 2, `second hit ${hits[1]}`);
+});
+
+test("trial ATK stack grows through Trial_AttackStack_2 maxStack on each real swing", () => {
+  const tank = blank("tank", { hp: 5_000_000, atk: 0, defn: 1701, spd: 1, el: "Ground" });
+  const trace: string[] = [];
+  fightOnce([tank], 1, new PyRandom(2), "plain", false, "Fire", false, 20, undefined, 1, trace);
+  const hits = trace.filter((line) => line.includes("boss hit")).map((line) => Number(line.match(/(\d+) damage/)?.[1]));
+  assert.ok(hits.length >= 8, `hits ${hits.length}`);
+  const early = (hits[0] + hits[1] + hits[2]) / 3;
+  const late = (hits[hits.length - 3] + hits[hits.length - 2] + hits[hits.length - 1]) / 3;
+  // Additive +15%/swing via Trial_AttackStack_2 payload.stacks should lift late damage.
+  assert.ok(late > early * 1.2, `early ${Math.round(early)} late ${Math.round(late)}`);
+});
+
+test("Fearless trial stack counts as a buff so battle skill becomes AoE", () => {
+  const a = blank("a", { hp: 5_000_000, atk: 0, defn: 5000, spd: 1, el: "Ice" });
+  const b = blank("b", { hp: 5_000_000, atk: 0, defn: 5000, spd: 1, el: "Ice" });
+  const c = blank("c", { hp: 5_000_000, atk: 0, defn: 5000, spd: 1, el: "Ice" });
+  const d = blank("d", { hp: 5_000_000, atk: 0, defn: 5000, spd: 1, el: "Ice" });
+  const trace: string[] = [];
+  fightOnce([a, b, c, d], 1, new PyRandom(3), "plain", false, "Fire", false, 8, undefined, 1, trace);
+  const byTurn = new Map<number, number>();
+  for (const line of trace) {
+    const m = line.match(/turn (\d+)\s+boss hit/);
+    if (!m) continue;
+    const t = Number(m[1]);
+    byTurn.set(t, (byTurn.get(t) || 0) + 1);
+  }
+  const aoeTurns = [...byTurn.values()].filter((n) => n >= 3).length;
+  assert.ok(aoeTurns >= 2, `expected multiple AoE turns after stack, got ${aoeTurns} from ${[...byTurn.entries()]}`);
+});
+
+test("Fearless Endure once: lethal hit drops to 1 hp with Immortal, not an instant clear", () => {
+  const nuke = blank("nuke", {
+    hp: 5_000_000,
+    atk: 500_000,
+    defn: 5000,
+    spd: 8000,
+    el: "Ground",
+    basic: { ...blank("x").basic, rate: 2 },
+  });
+  const soft = blank("soft", { hp: 5_000_000, atk: 0, defn: 500_000, spd: 1, el: "Ice" });
+  const trace: string[] = [];
+  // Soft soaks boss swings; nuke is the only damage dealer.
+  fightOnce([nuke, soft], 1, new PyRandom(2), "plain", false, "Fire", true, 40, undefined, 1, trace);
+  const bossHps = trace
+    .filter((l) => l.includes("nuke") && l.includes("boss"))
+    .map((l) => Number(l.match(/boss (\d+)/)?.[1]));
+  assert.ok(bossHps.length >= 2, `expected multiple nuke hits, got ${bossHps}`);
+  assert.ok(bossHps.some((hp) => hp === 1), `expected Endure at 1 hp, got ${bossHps.slice(0, 10)}`);
+  // First lethal must not be the clear — at least one hit remains at 1 before a later 0.
+  const atOne = bossHps.indexOf(1);
+  assert.ok(atOne >= 0 && (bossHps.indexOf(0) === -1 || bossHps.indexOf(0) > atOne), "0 hp should come after Endure");
 });
 
 test("trial bosses ignore poison, stun, and taunt, and still take bleed", () => {
@@ -220,7 +287,8 @@ test("trial bosses ignore poison, stun, and taunt, and still take bleed", () => 
   const pulled = fight([tank, squish]);
   const ignored = fight([tank, squish], "Ice");
   assert.ok(pulled.units[0].taken > pulled.units[1].taken);
-  assert.ok(ignored.units[1].taken > ignored.units[0].taken);
+  assert.equal(pulled.units[1].taken, 0);
+  assert.ok(ignored.units[0].taken > ignored.units[1].taken);
 });
 
 test("a pierce ultimate waits until the boss already has a debuff", () => {
@@ -237,7 +305,7 @@ test("a pierce ultimate waits until the boss already has a debuff", () => {
   assert.ok(opened.units[0].ults < opened.units[0].actions);
 });
 
-test("a heal with an attack buff casts immediately and a plain heal waits for half HP", () => {
+test("a heal with an attack buff casts immediately and a plain heal waits until 80% health", () => {
   const rain = blank("rain", {
     ult: ultOf({
       rate: 0,
@@ -293,6 +361,26 @@ test("heal over time is 6% of the unit who has it", () => {
   assert.ok(one.units[0].heal < 600 * 40);
 });
 
+test("ContinuousHeal refreshes instead of stacking copies", () => {
+  const unit = blank("hot", {
+    hp: 10_000,
+    defn: 500_000,
+    spd: 1,
+    atk: 0,
+    basic: { ...blank("hot").basic, rate: 0 },
+    start_statuses: [
+      { fid: "ContinuousHeal", rounds: 2, chance: 1 },
+      { fid: "ContinuousHeal", rounds: 2, chance: 1 },
+      { fid: "ContinuousHeal", rounds: 2, chance: 1 },
+    ],
+  });
+  const trace: string[] = [];
+  // One regen tick via a short fight against Fire with no damage dealt.
+  const one = fightOnce([unit], 1, new PyRandom(1), "plain", false, "Fire", false, 2, undefined, 1, trace);
+  // 6% of 10000 = 600 per tick; stacked copies would be 1800+.
+  assert.ok(one.heal <= 600 * 3, `heal ${one.heal} suggests stacked ContinuousHeal copies`);
+});
+
 test("a heal is a percent of the caster's max HP", () => {
   const healer = blank("healer", {
     hp: 10000,
@@ -343,8 +431,12 @@ test("accuracy down makes that unit's hits land for less", () => {
     el: "Fire",
     start_statuses: [{ fid: "DecreaseHitChance", chance: 1, rounds: 99 }],
   });
-  const clearDmg = fightOnce([clear], 1, new PyRandom(4), "plain", false, "Fire").damage;
-  const blurredDmg = fightOnce([blurred], 1, new PyRandom(4), "plain", false, "Fire").damage;
+  let clearDmg = 0;
+  let blurredDmg = 0;
+  for (let seed = 1; seed <= 20; seed++) {
+    clearDmg += fightOnce([clear], 1, new PyRandom(seed), "plain", false, "Fire").damage;
+    blurredDmg += fightOnce([blurred], 1, new PyRandom(seed), "plain", false, "Fire").damage;
+  }
   assert.ok(blurredDmg < clearDmg);
 });
 
@@ -458,8 +550,8 @@ test("a shield lasts its turn count and a hit can break it early", () => {
     start_shields: [{ rate: 0.1, prop: "MaxHP", aim: "self", rounds: 1 }],
   });
   const renewed = fight([kept]);
-  assert.equal(renewed.units[0].shield, 500_000);
-  assert.ok(renewed.units[0].shield_left > 400_000 && renewed.units[0].shield_left < 500_000);
+  assert.ok(renewed.units[0].shield > 500_000);
+  assert.ok(renewed.units[0].shield_left > 500_000);
   const cracked = blank("cracked", {
     hp: 20_000,
     defn: 0,
@@ -473,7 +565,7 @@ test("a shield lasts its turn count and a hit can break it early", () => {
 });
 
 test("a trial clear ends when the boss dies instead of refilling the boss", () => {
-  const killer = blank("killer", { hp: 500000, atk: 8000, defn: 5000, spd: 3000 });
+  const killer = blank("killer", { hp: 500000, atk: 20000, defn: 5000, spd: 3000 });
   const once = fightOnce([killer], 1, new PyRandom(1), "plain", false, "Fire", true);
   assert.equal(once.kills, 1);
   assert.ok(once.units[0].hp_left > 0);
