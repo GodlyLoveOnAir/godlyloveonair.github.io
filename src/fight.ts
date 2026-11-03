@@ -697,8 +697,13 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
   };
   let primary = 0;
   let steps = 0;
+  let clearAt = -1;
   const counterDepth = [0];
   const bucket = () => Math.min(primary, TURNS - 1);
+  const markClear = (enemy: AnyRec) => {
+    if (enemy.boss === false || clearAt >= 0) return;
+    clearAt = bucket();
+  };
   const noteDamage = (ally: AnyRec, amount: number) => {
     ally.damage += amount;
     ally.turns[bucket()] += amount;
@@ -1310,10 +1315,9 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     const rolled = hitRoll(rng, dodge, edge > 0 ? CONQUER_CRIT : 0, magSum(enemy.buffs, "crit"), magSum(enemy.buffs, "cdmg"), magSum(ally.buffs, "cres"), edge > 0);
     const mult = rolled.mult;
     const covered = hurtCut(ally, sk || null);
-    // Story enemies use AttackPowerRate. Trial bosses do not.
     let raw = directDamage(bossAtk(enemy), allyDef(ally), mult, {
       rate,
-      power: trial ? 1 : ATTACK_POWER_RATE,
+      power: ATTACK_POWER_RATE,
       pens: pens || { 1: 0, 2: 0, 3: 0 },
       buffs: ally.buffs,
       conquer: edge > 0 ? 1.1 : 1,
@@ -1477,12 +1481,16 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     }
     let justKilled = false;
     for (const e of enemies) {
-      if (e.hp <= 0) {
-        justKilled = true;
-        onDead();
-        e.kills += 1;
-        if (endOnKill) lost = bossesDown();
-        else e.hp = e.hp_max;
+      if (e.hp > 0 || e.dead) continue;
+      e.dead = true;
+      justKilled = true;
+      onDead();
+      e.kills += 1;
+      markClear(e);
+      if (endOnKill) lost = bossesDown();
+      else {
+        e.hp = e.hp_max;
+        e.dead = false;
       }
     }
     ally.just_killed = justKilled;
@@ -1997,17 +2005,20 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     }
     enemy.dots = enemy.dots.filter((d: AnyRec) => d.rounds > 0);
     tickRegen(enemy);
-    if (enemy.hp <= 0) {
+    if (enemy.hp <= 0 && !enemy.dead) {
       bossSurvive(enemy);
       if (enemy.hp <= 0) {
+        enemy.dead = true;
         onDead();
         enemy.kills += 1;
+        markClear(enemy);
         enemy.g = 0;
         if (endOnKill) {
           lost = bossesDown();
           return;
         }
         enemy.hp = enemy.hp_max;
+        enemy.dead = false;
       }
     }
     if (has(enemy.buffs, "Stun") || has(enemy.buffs, "Sleep")) {
@@ -2135,9 +2146,11 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
     shield: allies.reduce((s, a) => s + a.shield, 0),
     taken: allies.reduce((s, a) => s + a.taken, 0),
     rounds: primary,
+    clearAt,
     actions: allies.reduce((sum, ally) => sum + ally.actions, 0),
     pruned,
     kills: enemies.reduce((s, e) => s + e.kills, 0),
+    bossKills: enemies.filter((e) => e.boss !== false).reduce((s, e) => s + e.kills, 0),
     turns: Array.from({ length: TURNS }, (_, i) => allies.reduce((s, a) => s + a.turns[i], 0)),
     heal_turns: Array.from({ length: TURNS }, (_, i) => allies.reduce((s, a) => s + a.heal_turns[i], 0)),
     shield_turns: Array.from({ length: TURNS }, (_, i) => allies.reduce((s, a) => s + a.shield_turns[i], 0)),
@@ -2169,18 +2182,12 @@ export function fightOnce(units: AnyRec[], nEnemies: number, rng: PyRandom, boss
 function averageFights(units: AnyRec[], enemies: number, boss: AnyRec, seedAt: (run: number) => number, element = "") {
   const started = performance.now();
   let acc: any = null;
-  for (let i = 0; i < RUNS; i++) {
-    const one = fightOnce(units, enemies, new PyRandom(seedAt(i)), boss.id, false, element);
-    if (!acc) {
-      acc = one;
-      continue;
-    }
-    acc.damage += one.damage;
-    acc.heal += one.heal;
-    acc.shield += one.shield;
-    acc.taken += one.taken;
-    acc.kills += one.kills;
-    for (let t = 0; t < TURNS; t++) {
+  const clearAts: number[] = [];
+  const covered = Array(TURNS).fill(0);
+  const addSeries = (one: AnyRec) => {
+    const end = one.clearAt < 0 ? TURNS : Math.min(TURNS, one.clearAt + 1);
+    for (let t = 0; t < end; t++) {
+      covered[t] += 1;
       acc.turns[t] += one.turns[t];
       acc.heal_turns[t] += one.heal_turns[t];
       acc.shield_turns[t] += one.shield_turns[t];
@@ -2190,6 +2197,41 @@ function averageFights(units: AnyRec[], enemies: number, boss: AnyRec, seedAt: (
         acc.units[u].shield_turns[t] += one.units[u].shield_turns[t];
       }
     }
+  };
+  for (let i = 0; i < RUNS; i++) {
+    const fought = fightOnce(units, enemies, new PyRandom(seedAt(i)), boss.id, false, element);
+    const one = {
+      ...fought,
+      turns: fought.turns.slice(),
+      heal_turns: fought.heal_turns.slice(),
+      shield_turns: fought.shield_turns.slice(),
+      units: fought.units.map((unit: AnyRec) => ({
+        ...unit,
+        turns: unit.turns.slice(),
+        heal_turns: unit.heal_turns.slice(),
+        shield_turns: unit.shield_turns.slice(),
+      })),
+    };
+    clearAts.push(one.clearAt);
+    if (!acc) {
+      acc = fought;
+      acc.turns = Array(TURNS).fill(0);
+      acc.heal_turns = Array(TURNS).fill(0);
+      acc.shield_turns = Array(TURNS).fill(0);
+      for (const unit of acc.units) {
+        unit.turns = Array(TURNS).fill(0);
+        unit.heal_turns = Array(TURNS).fill(0);
+        unit.shield_turns = Array(TURNS).fill(0);
+      }
+      addSeries(one);
+      continue;
+    }
+    acc.damage += one.damage;
+    acc.heal += one.heal;
+    acc.shield += one.shield;
+    acc.taken += one.taken;
+    acc.kills += one.kills;
+    addSeries(one);
     for (let u = 0; u < acc.units.length; u++) {
       const a = acc.units[u];
       const b = one.units[u];
@@ -2201,7 +2243,10 @@ function averageFights(units: AnyRec[], enemies: number, boss: AnyRec, seedAt: (
       a.ults += b.ults;
     }
   }
+  const killed = clearAts.filter((turn) => turn >= 0).sort((a, b) => a - b);
+  const span = killed.length ? killed[Math.floor(killed.length / 2)] + 1 : TURNS;
   const round = (n: number) => Math.round(n / RUNS);
+  const roundTurn = (values: number[]) => values.slice(0, span).map((value, turn) => covered[turn] ? Math.round(value / covered[turn]) : 0);
   for (const a of acc.units) {
     a.damage = round(a.damage);
     a.heal = round(a.heal);
@@ -2209,9 +2254,9 @@ function averageFights(units: AnyRec[], enemies: number, boss: AnyRec, seedAt: (
     a.taken = round(a.taken);
     a.actions = round(a.actions);
     a.ults = round(a.ults);
-    a.turns = a.turns.map((v: number) => round(v));
-    a.heal_turns = a.heal_turns.map((v: number) => round(v));
-    a.shield_turns = a.shield_turns.map((v: number) => round(v));
+    a.turns = roundTurn(a.turns);
+    a.heal_turns = roundTurn(a.heal_turns);
+    a.shield_turns = roundTurn(a.shield_turns);
   }
   return {
     runs: RUNS,
@@ -2223,7 +2268,7 @@ function averageFights(units: AnyRec[], enemies: number, boss: AnyRec, seedAt: (
     team_shield: round(acc.shield),
     taken: round(acc.taken),
     kills: Math.round((acc.kills / RUNS) * 10) / 10,
-    turns: acc.turns.map((v: number) => round(v)),
+    turns: roundTurn(acc.turns),
     units: acc.units,
   };
 }

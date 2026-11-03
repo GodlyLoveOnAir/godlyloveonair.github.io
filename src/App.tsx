@@ -21,8 +21,10 @@ type Unit = {
 const units = roster as Unit[];
 const byId = new Map(units.map((unit) => [unit.id, unit]));
 
-function leaderBoard(rarity: "ssr" | "sr", release: "all" | "released", stars: "0" | "3" | "5", n: "1" | "3", element = "") {
-  const key = rarity === "sr" ? (release === "released" ? "srReleased" : "sr") : release;
+function leaderBoard(rarity: "ssr" | "sr", release: "all" | "released", stars: "0" | "3" | "5", n: "1" | "3", element = "", long = false) {
+  const key = rarity === "sr"
+    ? (release === "released" ? (long ? "srLongReleased" : "srReleased") : (long ? "srLong" : "sr"))
+    : (long ? (release === "released" ? "longReleased" : "longAll") : release);
   if (element) return (((leaders as any).byElement?.[element]?.[stars]?.[key])?.[n] ?? null) as any[] | null;
   const starred = (leaders as any).byStar?.[stars]?.[key];
   const legacy = stars === "5" ? (leaders as any)[key] : undefined;
@@ -252,7 +254,7 @@ function TurnChart({ units }: { units: { id: string; name: string; turns: number
   return (
     <div className="mt-5">
       <h3 className="font-display text-xl">Each turn</h3>
-      <p className="mt-1 text-sm text-white/60">The solid line is damage, the dashed line is healing, and the dotted line is shield. Hover over a turn to see the breakdown. Click a name to hide that unit.</p>
+      <p className="mt-1 text-sm text-white/60">The solid line is damage, the dashed line is healing, and the dotted line is shield. The lines stop on the turn the boss first dies. The totals above keep running for 30 boss turns, and the boss returns after each defeat. Hover over a turn to see the breakdown. Click a name to hide that unit.</p>
       <div className="mt-3 flex flex-wrap gap-2">
         {units.map((unit, index) => (
           <button
@@ -530,6 +532,7 @@ export default function App() {
   const [leaderRarity, setLeaderRarity] = useState<"ssr" | "sr">("ssr");
   const [leaderRelease, setLeaderRelease] = useState<"all" | "released">("released");
   const [leaderStars, setLeaderStars] = useState<"0" | "3" | "5">("5");
+  const [leaderFight, setLeaderFight] = useState<"trial" | "long">("long");
   const leaderN = "1";
   const [leaderElement, setLeaderElement] = useState("Fire");
   const [enemyN, setEnemyN] = useState(1);
@@ -554,10 +557,11 @@ export default function App() {
   const bossKit = trialBoss(leaderElement)!;
   const starChoices = leaderRarity === "sr" ? SR_STAR_CHOICES : SSR_STAR_CHOICES;
   const activeStar = (starChoices as readonly string[]).includes(leaderStars) ? leaderStars : starChoices[0];
-  const board = leaderBoard(leaderRarity, leaderRelease, activeStar, leaderN, leaderElement);
+  const longFight = leaderFight === "long" && ((leaderRarity === "ssr" && activeStar === "3") || (leaderRarity === "sr" && activeStar === "5"));
+  const board = leaderBoard(leaderRarity, leaderRelease, activeStar, leaderN, leaderElement, longFight);
   const rows = board ?? [];
   const releaseChoices = (["released", "all"] as const).filter((release) =>
-    boardHasTeams(leaderBoard(leaderRarity, release, activeStar, "1", leaderElement)),
+    boardHasTeams(leaderBoard(leaderRarity, release, activeStar, "1", leaderElement, longFight)),
   );
   useEffect(() => {
     if ((starChoices as readonly string[]).includes(leaderStars)) return;
@@ -704,6 +708,16 @@ export default function App() {
                       label: id === "0" ? "Base" : id === "3" ? "3★ passive" : "5★",
                     }))}
                   />
+                  {((leaderRarity === "ssr" && activeStar === "3") || (leaderRarity === "sr" && activeStar === "5")) && (
+                  <Segmented
+                    value={leaderFight}
+                    onChange={(id) => setLeaderFight(id as "trial" | "long")}
+                    options={[
+                      { id: "trial", label: "Trial" },
+                      { id: "long", label: "500k HP" },
+                    ]}
+                  />
+                  )}
                   <Segmented
                     value={leaderElement}
                     onChange={setLeaderElement}
@@ -718,10 +732,17 @@ export default function App() {
                 {activeStar === "0" && "Base is 0★. The passive is off, and HP, attack, and defense have no ascension bonus. "}
                 {activeStar === "3" && "3★ turns the passive on. HP, attack, and defense are ×1.35. "}
                 {activeStar === "5" && "5★ is the full ascension. The passive is on, and HP, attack, and defense are ×2. "}
-                {`The ${elementName(leaderElement)} boss is ${bossKit.name} from Phantom Trial stage ${bossKit.stage}: ${fmt(bossKit.hp)} HP, ${fmt(bossKit.atk)} attack, ${fmt(bossKit.defn)} defense, ${fmt(bossKit.spd)} speed. The boss uses that unit's basic, ultimate, and passive, and gains 15% attack at the start of each turn.`}
+                {longFight
+                  ? `The ${elementName(leaderElement)} boss is ${bossKit.name} with 500,000 HP. Attack ${fmt(bossKit.atk)}, defense ${fmt(bossKit.defn)}, and speed ${fmt(bossKit.spd)} stay on the trial sheet. The boss uses that unit's basic, ultimate, and passive, and gains 15% attack at the start of each turn.`
+                  : `The ${elementName(leaderElement)} boss is ${bossKit.name} from Phantom Trial stage ${bossKit.stage}: ${fmt(bossKit.hp)} HP, ${fmt(bossKit.atk)} attack, ${fmt(bossKit.defn)} defense, ${fmt(bossKit.spd)} speed. The boss uses that unit's basic, ultimate, and passive, and gains 15% attack at the start of each turn.`}
               </p>
               <div className="mt-3 rounded-2xl bg-white/10 px-4 py-3 ring-1 ring-ember">
-                {leaderRarity === "ssr" ? (
+                {longFight ? (
+                  <>
+                    <p className="text-xs uppercase tracking-[0.16em] text-ember">This list · 500k HP</p>
+                    <p className="mt-1 text-sm text-white/80">The fight ends when the boss dies, or at 80 boss turns. A team has to clear three times, with someone still standing. The slower clear decides the order: boss turns, then ally actions, then damage taken. If nobody clears, the list is the teams that dealt the most damage.</p>
+                  </>
+                ) : leaderRarity === "ssr" ? (
                   <>
                     <p className="text-xs uppercase tracking-[0.16em] text-ember">This list · SSR</p>
                     <p className="mt-1 text-sm text-white/80">The fight ends when the boss dies. A team has to clear three times in a row, with someone still standing each time. The slower clear decides the order: boss turns, then ally actions, then damage taken. If no team clears three times within 15 boss turns, the list shows the teams that dealt the most damage.</p>

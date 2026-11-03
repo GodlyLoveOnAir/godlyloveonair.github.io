@@ -1,5 +1,5 @@
 import assert from "assert";
-import { directDamage, fightOnce, trialBoss } from "./fight";
+import { directDamage, fightOnce, simulate, trialBoss } from "./fight";
 import { PyRandom } from "./random";
 
 const data = (globalThis as { __KAMI: any }).__KAMI;
@@ -204,16 +204,16 @@ test("element bosses are the phantom trial units and neutral stays plain", () =>
   assert.equal(marked.units[0].taken, held.units[0].taken);
 });
 
-test("trial Fire boss hits allies without AttackPowerRate and stacks on the swing", () => {
+test("trial Fire boss hits allies with AttackPowerRate and stacks on the swing", () => {
   const tank = blank("tank", { hp: 5_000_000, atk: 0, defn: 1701, spd: 1, el: "Ground" });
   const trace: string[] = [];
   fightOnce([tank], 1, new PyRandom(1), "plain", false, "Fire", false, 5, undefined, 1, trace);
   const hits = trace.filter((line) => line.includes("boss hit")).map((line) => Number(line.match(/(\d+) damage/)?.[1]));
   assert.ok(hits.length >= 2, "expected boss hits");
-  // Opens with ult (rate 1.44) at one +15% stack. No AttackPowerRate.
-  assert.ok(Math.abs(hits[0] - 2537) < 2, `first hit ${hits[0]}`);
-  // The ult's ATK Up turns the next swing into the 0.8 AoE. Two stacks plus that +20% crits for 2390, under the ult.
-  assert.ok(Math.abs(hits[1] - 2390) < 2, `second hit ${hits[1]}`);
+  // Opens with ult (rate 1.44) at one +15% stack, with AttackPowerRate.
+  assert.ok(Math.abs(hits[0] - 4746) < 2, `first hit ${hits[0]}`);
+  // The ult's ATK Up turns the next swing into the 0.8 AoE. Two stacks plus that +20% crits, under the ult.
+  assert.ok(Math.abs(hits[1] - 4471) < 2, `second hit ${hits[1]}`);
 });
 
 test("trial ATK stack grows through Trial_AttackStack_2 maxStack on each real swing", () => {
@@ -564,12 +564,27 @@ test("a shield lasts its turn count and a hit can break it early", () => {
   assert.equal(broken.units[0].shield_left, 0);
 });
 
+test("the damage chart stops on the turn the boss first dies", () => {
+  const row = data.leaders.byElement.Ice["3"].all["1"][0];
+  const ids = row.units.map((unit: { id: string }) => unit.id);
+  const result = simulate(ids, ids.map(() => 3), 1, "plain", "Ice");
+  assert.ok(result);
+  assert.ok(result.units[0].turns.length < 15, `chart ran ${result.units[0].turns.length} turns`);
+  assert.ok(result.turns.length === result.units[0].turns.length);
+  assert.ok(result.units.every((unit: { turns: number[]; heal_turns: number[]; shield_turns: number[] }) =>
+    unit.turns.length === result.turns.length && unit.heal_turns.length === result.turns.length && unit.shield_turns.length === result.turns.length));
+  assert.ok(result.turns.some((value: number) => value > 0));
+});
+
 test("a trial clear ends when the boss dies instead of refilling the boss", () => {
   const killer = blank("killer", { hp: 500000, atk: 20000, defn: 5000, spd: 3000 });
   const once = fightOnce([killer], 1, new PyRandom(1), "plain", false, "Fire", true);
   assert.equal(once.kills, 1);
   assert.ok(once.units[0].hp_left > 0);
-  assert.ok(fight([killer], "Fire").kills > 1);
+  assert.ok(once.clearAt >= 0 && once.clearAt < 15);
+  const farm = fight([killer], "Fire");
+  assert.ok(farm.kills > 1);
+  assert.equal(farm.clearAt, once.clearAt);
   const glass = blank("glass", { hp: 500, atk: 1, defn: 0, spd: 100 });
   const wiped = fightOnce([glass], 1, new PyRandom(1), "plain", false, "Fire", true);
   assert.equal(wiped.kills, 0);
