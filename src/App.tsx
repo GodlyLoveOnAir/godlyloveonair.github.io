@@ -35,7 +35,7 @@ function boardHasTeams(list: any[] | null) {
   return Array.isArray(list) && list.length > 0;
 }
 const SSR_STAR_CHOICES = ["3", "0"] as const;
-const SR_STAR_CHOICES = ["3", "5"] as const;
+const SR_STAR_CHOICES = ["5"] as const;
 const ELEMENT_CHOICES = ["Fire", "Ice", "Earth", "Ground"] as const;
 const ELEMENT_LABEL: Record<string, string> = { Earth: "Wind" };
 
@@ -700,6 +700,7 @@ export default function App() {
                     }))}
                   />
                   )}
+                  {starChoices.length > 1 && (
                   <Segmented
                     value={activeStar}
                     onChange={(id) => setLeaderStars(id as "0" | "3" | "5")}
@@ -708,6 +709,7 @@ export default function App() {
                       label: id === "0" ? "Base" : id === "3" ? "3★ passive" : "5★",
                     }))}
                   />
+                  )}
                   {((leaderRarity === "ssr" && activeStar === "3") || (leaderRarity === "sr" && activeStar === "5")) && (
                   <Segmented
                     value={leaderFight}
