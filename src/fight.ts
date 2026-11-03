@@ -2468,7 +2468,7 @@ function cooldownPhrase(turns: number) {
 
 export function skillCooldown(id: string, skillName: string, lines: string[], meta = "") {
   const blob = `${meta}\n${lines.join("\n")}`;
-  if (/cooldown\s*:?\s*\d+/i.test(blob) || /every\s*\d+\s*turns?/i.test(blob)) return "";
+  if (/cooldown\s*:?\s*\d+/i.test(blob) || /every\s*\d+\s*turns?/i.test(blob) || /once per battle/i.test(blob)) return "";
   const unit = data.units[id]?.["5"];
   if (!unit) return "";
   if (skillName === "Basic") return Number(unit.basic?.cd) > 0 ? cooldownPhrase(Number(unit.basic.cd)) : "";
@@ -2482,7 +2482,9 @@ export function skillCooldown(id: string, skillName: string, lines: string[], me
   for (const proc of unit.basic_procs || []) if (Number(proc.cd) > 0) found.add(Number(proc.cd));
   for (const row of unit.timed || []) if (Number(row.cd_after) > 0) found.add(Number(row.cd_after));
   if (found.size !== 1) return "";
-  return `Once every ${[...found][0]} turns.`;
+  const turns = [...found][0];
+  if (turns >= 100) return "Once per battle.";
+  return `Once every ${turns} turns.`;
 }
 
 export const roster = data.roster as any[];
